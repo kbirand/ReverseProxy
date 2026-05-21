@@ -1,16 +1,13 @@
 const express = require('express');
 const db = require('../db');
-const { renderConfig, pushConfig } = require('../caddy');
+const { reloadCaddy } = require('../sync');
 
 function buildRouter(database) {
   const r = express.Router();
 
   async function reloadFromDb() {
-    const rules = db.listRules(database);
-    const config = renderConfig(rules);
-    await pushConfig(config);
-    db.setMeta(database, 'last_reload_at', Date.now());
-    return rules.length;
+    const { rules } = await reloadCaddy(database);
+    return rules;
   }
 
   r.get('/', (req, res) => {

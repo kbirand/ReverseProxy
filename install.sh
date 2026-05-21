@@ -32,6 +32,7 @@ UI_BIND=0.0.0.0
 FALLBACK_UPSTREAM=""
 ACME_DNS_PROVIDER=""
 ACME_EMAIL=""
+AUTH_ENABLED=true
 # shellcheck disable=SC1090
 source "$CONF"
 
@@ -87,6 +88,10 @@ install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" /var/lib/rproxy
 install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" "$CERT_DIR"
 # Caddy (running as user 'caddy') must read manual certs under $CERT_DIR.
 usermod -a -G "$RUN_USER" caddy
+# Caddy writes the JSON access log here; the UI reads it for the activity
+# view, so the run user needs to be in caddy's group.
+install -d -m 0750 -o caddy -g caddy /var/log/rproxy
+usermod -a -G caddy "$RUN_USER"
 # Let the run user traverse + read the repo (it may live under /home).
 chmod o+x "$REPO_DIR" 2>/dev/null || true
 chmod -R o+rX "$REPO_DIR/src" "$REPO_DIR/package.json" "$REPO_DIR/package-lock.json" 2>/dev/null || true
@@ -135,10 +140,13 @@ Environment=BIND=$UI_BIND
 Environment=DB_PATH=$DB_PATH
 Environment=CADDY_ADMIN=http://127.0.0.1:2019
 Environment=CERT_DIR=$CERT_DIR
+Environment=ACCESS_LOG=/var/log/rproxy/access.log
 Environment=FALLBACK_UPSTREAM=$FALLBACK_UPSTREAM
 Environment=FALLBACK_HOSTS=$FALLBACK_HOSTS
 Environment=ACME_DNS_PROVIDER=$ACME_DNS_PROVIDER
 Environment=ACME_EMAIL=$ACME_EMAIL
+Environment=AUTH_ENABLED=$AUTH_ENABLED
+Environment=COOKIE_SECURE=false
 ExecStart=/usr/bin/node src/server.js
 Restart=always
 RestartSec=2
@@ -158,26 +166,37 @@ ProtectControlGroups=true
 WantedBy=multi-user.target
 EOF
 
+# self-update units: a path unit watches for the UI's request file and starts
+# the privileged updater. No sudo needed — keeps the UI sandbox intact.
+chmod +x "$REPO_DIR/scripts/update.sh"
+sed "s|__REPO_DIR__|$REPO_DIR|g" "$REPO_DIR/etc/rproxy-update.service" \
+  > /etc/systemd/system/rproxy-update.service
+install -m 0644 "$REPO_DIR/etc/rproxy-update.path" /etc/systemd/system/rproxy-update.path
+
 # ---- 8. enable + (re)start services ----------------------------------------
 echo "[8/9] Enabling and starting services ..."
 systemctl daemon-reload
-systemctl enable caddy rproxy-ui >/dev/null 2>&1
+systemctl enable caddy rproxy-ui rproxy-update.path >/dev/null 2>&1
 systemctl restart caddy
 sleep 2
 systemctl restart rproxy-ui
+systemctl restart rproxy-update.path
 sleep 2
 
 # ---- 9. health check -------------------------------------------------------
 echo "[9/9] Health check ..."
 CADDY_OK=$(systemctl is-active caddy || true)
 UI_OK=$(systemctl is-active rproxy-ui || true)
-HEALTH=$(curl -sf "http://127.0.0.1:${UI_PORT}/api/system/health" 2>/dev/null || echo '{}')
-echo "       caddy: $CADDY_OK · rproxy-ui: $UI_OK"
-echo "       health: $HEALTH"
+# /api/auth/me always answers (200 authed / 401 not) — any response = UI is up.
+UI_HTTP=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${UI_PORT}/api/auth/me" 2>/dev/null || echo 000)
+echo "       caddy: $CADDY_OK · rproxy-ui: $UI_OK · UI responding: $([ "$UI_HTTP" != 000 ] && echo yes || echo no)"
 
 echo
 echo "=== Done ==="
 echo "  Admin UI:  http://${PRIMARY_IP:-127.0.0.1}:${UI_PORT}/"
+if [[ "$AUTH_ENABLED" != "false" ]]; then
+  echo "  Login:     admin / admin  —  CHANGE THIS immediately in the UI."
+fi
 if [[ "$ACME_DNS_PROVIDER" == "cloudflare" ]] && ! grep -q '^CF_API_TOKEN=.\+' "$CF_ENV" 2>/dev/null; then
   echo
   echo "  NEXT STEP — paste your Cloudflare API token:"

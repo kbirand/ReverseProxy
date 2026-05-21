@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for an rproxy update request
+
+[Path]
+# The UI writes this file (it has ReadWritePaths=/var/lib/rproxy) to request
+# a self-update; systemd then starts the privileged rproxy-update.service.
+PathExists=/var/lib/rproxy/.update-requested
+Unit=rproxy-update.service
+
+[Install]
+WantedBy=multi-user.target

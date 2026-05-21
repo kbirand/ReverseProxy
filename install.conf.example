@@ -24,3 +24,8 @@ ACME_DNS_PROVIDER=cloudflare
 # Email registered with Let's Encrypt (expiry notices if auto-renewal fails).
 # Optional but recommended.
 ACME_EMAIL=
+
+# Require a login for the admin UI (true/false). Default true.
+# First run seeds admin/admin — change it immediately in the UI.
+# Set to false ONLY on a fully trusted, isolated network.
+AUTH_ENABLED=true

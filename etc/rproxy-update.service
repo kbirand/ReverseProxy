@@ -1,0 +1,13 @@
+[Unit]
+Description=rproxy self-update (git pull + npm install + restart)
+# Runs in its own cgroup as root, so restarting rproxy-ui from inside the
+# update script does not kill the update itself. Triggered by rproxy-update.path
+# when the UI writes /var/lib/rproxy/.update-requested.
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/rm -f /var/lib/rproxy/.update-requested
+ExecStart=__REPO_DIR__/scripts/update.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300

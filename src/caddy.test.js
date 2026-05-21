@@ -144,6 +144,35 @@ test('deny_ips produces a 403 route before the proxy route', () => {
   assert.deepEqual(deny.match[0].host, ['example.com']);
 });
 
+test('whitelist mode rejects the unlisted (not + client_ip matcher)', () => {
+  const cfg = renderConfig([
+    { ...baseRule, tls_mode: 'http', access_mode: 'whitelist', deny_ips: '1.2.3.4\n10.0.0.0/8' },
+  ]);
+  const routes = cfg.apps.http.servers.srv_http.routes;
+  const acl = routes.find((r) => r.match && r.match[0].not);
+  assert.ok(acl, 'whitelist ACL route uses a not-matcher');
+  assert.deepEqual(acl.match[0].host, ['example.com']);
+  assert.deepEqual(acl.match[0].not[0].client_ip.ranges, ['1.2.3.4', '10.0.0.0/8']);
+  // and it comes before the proxy route
+  const proxyIdx = routes.findIndex((r) => r.match && r.match[0].host?.includes('example.com')
+    && r.handle.find((h) => h.handler === 'reverse_proxy'));
+  const aclIdx = routes.indexOf(acl);
+  assert.ok(aclIdx < proxyIdx, 'ACL route precedes proxy route');
+});
+
+test('blacklist mode (default) rejects the listed (plain client_ip matcher)', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http', deny_ips: '1.2.3.4' }]);
+  const acl = cfg.apps.http.servers.srv_http.routes.find((r) => r.match && r.match[0].client_ip);
+  assert.ok(acl, 'blacklist uses a direct client_ip matcher');
+  assert.equal(acl.match[0].not, undefined, 'blacklist has no not-matcher');
+});
+
+test('empty IP list disables ACL even in whitelist mode (no lockout)', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http', access_mode: 'whitelist', deny_ips: '' }]);
+  const routes = cfg.apps.http.servers.srv_http.routes;
+  assert.equal(routes.find((r) => r.match && (r.match[0].not || r.match[0].client_ip)), undefined);
+});
+
 test('deny_redirect turns the deny route into a 302', () => {
   const cfg = renderConfig([
     { ...baseRule, tls_mode: 'http', deny_ips: '1.2.3.4', deny_redirect: 'https://example.com/blocked' },
@@ -185,6 +214,38 @@ test('deny route on non-http rule appears on both :80 and :443', () => {
   const httpsDeny = cfg.apps.http.servers.srv_https.routes.find((r) => r.match && r.match[0].client_ip);
   assert.ok(httpDeny,  'deny route on :80');
   assert.ok(httpsDeny, 'deny route on :443');
+});
+
+test('global blocklist emits a first-priority client_ip reject route', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'letsencrypt' }], {
+    globalBlocks: ['1.2.3.4', '10.0.0.0/8'],
+  });
+  const httpFirst  = cfg.apps.http.servers.srv_http.routes[0];
+  const httpsFirst = cfg.apps.http.servers.srv_https.routes[0];
+  for (const route of [httpFirst, httpsFirst]) {
+    assert.ok(route.match[0].client_ip, 'first route matches client_ip');
+    assert.deepEqual(route.match[0].client_ip.ranges, ['1.2.3.4', '10.0.0.0/8']);
+    assert.equal(route.handle[0].status_code, 403);
+    assert.equal(route.match[0].host, undefined, 'global block matches any host');
+  }
+});
+
+test('no global blocks => no global block route', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http' }], { globalBlocks: [] });
+  const first = cfg.apps.http.servers.srv_http.routes[0];
+  assert.ok(!(first.match && first.match[0] && first.match[0].client_ip && !first.match[0].host),
+    'no host-less client_ip route at the top');
+});
+
+test('access logging writes JSON to a file, kept out of journald', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http' }], { accessLogPath: '/tmp/a.log' });
+  const access = cfg.logging.logs.access;
+  assert.equal(access.writer.output, 'file');
+  assert.equal(access.writer.filename, '/tmp/a.log');
+  assert.equal(access.encoder.format, 'json');
+  assert.ok(cfg.logging.logs.default.exclude.includes('http.log.access'));
+  assert.ok(cfg.logging.logs.access.include.includes('http.log.access'));
+  assert.deepEqual(cfg.apps.http.servers.srv_http.logs, {});
 });
 
 test('user rules + fallback + 404 are ordered correctly', () => {

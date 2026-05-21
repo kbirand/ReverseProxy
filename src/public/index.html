@@ -7,39 +7,138 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <div id="login-overlay" class="login-overlay" hidden>
+    <form id="login-form" class="login-card">
+      <div class="login-brand">RProxy</div>
+      <p class="login-sub">Sign in to manage the reverse proxy</p>
+      <div id="login-error" class="error" hidden></div>
+      <label>Username
+        <input name="username" autocomplete="username" autocapitalize="off" autocorrect="off" required>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit" class="primary" id="login-submit">Sign in</button>
+    </form>
+  </div>
+
   <header class="topbar">
-    <div class="brand">rproxy</div>
+    <div class="brand">RProxy</div>
+    <nav class="nav">
+      <button id="nav-rules" class="nav-btn active">Rules</button>
+      <button id="nav-activity" class="nav-btn">Activity</button>
+      <button id="nav-blocklist" class="nav-btn">Blocklist</button>
+    </nav>
     <div class="status" id="status">…</div>
-    <input type="search" id="search" class="search" placeholder="Filter — try *.com or api* or 3001"
+    <input type="search" id="search" class="search rules-only" placeholder="Filter — try *.com or api* or 3001"
            autocomplete="off" spellcheck="false">
     <div class="actions">
-      <button id="btn-copy" title="Copy detailed rule list to clipboard (for sharing with AI assistants)">Copy details</button>
-      <button id="btn-new" class="primary">+ New rule</button>
+      <button id="btn-copy" class="rules-only" title="Copy detailed rule list to clipboard (for sharing with AI assistants)">Copy details</button>
+      <button id="btn-new" class="primary rules-only">+ New rule</button>
       <button id="btn-reload">Reload Caddy</button>
+      <button id="btn-password" title="Change the admin password">Password</button>
+      <button id="btn-logout">Logout</button>
     </div>
   </header>
 
   <main>
+    <div id="pw-warning" class="warn-banner" hidden>
+      <span>⚠ The admin password is still the default <code>admin</code> / <code>admin</code>.</span>
+      <button id="pw-warning-change" class="ub-link" type="button">change it now</button>
+      <span class="grow"></span>
+      <button id="pw-warning-dismiss" class="ub-x" type="button" title="Dismiss">✕</button>
+    </div>
+    <div id="update-banner" class="update-banner" hidden>
+      <span id="ub-text"></span>
+      <button id="ub-details" class="ub-link" type="button">what changed</button>
+      <span class="grow"></span>
+      <button id="ub-install" class="primary" type="button">Install update</button>
+      <button id="ub-dismiss" class="ub-x" type="button" title="Dismiss">✕</button>
+    </div>
+    <div id="update-changes" class="update-changes" hidden></div>
+
     <section id="error" class="error" hidden></section>
-    <table id="rules-table">
-      <thead>
-        <tr>
-          <th data-sort="enabled">Enabled</th>
-          <th data-sort="hostname">Hostname</th>
-          <th data-sort="backend_host">Backend</th>
-          <th data-sort="backend_port">Port</th>
-          <th data-sort="tls_mode">TLS</th>
-          <th data-sort="cert_days">Cert expiry</th>
-          <th data-sort="add_www">www</th>
-          <th data-sort="websocket">WS</th>
-          <th data-sort="hsts">HSTS</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody id="rules-body">
-        <tr><td colspan="10" class="muted">Loading…</td></tr>
-      </tbody>
-    </table>
+
+    <div id="view-rules">
+      <table id="rules-table">
+        <thead>
+          <tr>
+            <th data-sort="enabled">Enabled</th>
+            <th data-sort="hostname">Hostname</th>
+            <th data-sort="backend_host">Backend</th>
+            <th data-sort="backend_port">Port</th>
+            <th data-sort="tls_mode">TLS</th>
+            <th data-sort="cert_days">Cert expiry</th>
+            <th data-sort="add_www">www</th>
+            <th data-sort="websocket">WS</th>
+            <th data-sort="hsts">HSTS</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rules-body">
+          <tr><td colspan="10" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div id="view-activity" hidden>
+      <div class="activity-toolbar">
+        <label class="inline">Window
+          <select id="activity-window">
+            <option value="1">last 1 h</option>
+            <option value="24" selected>last 24 h</option>
+            <option value="168">last 7 d</option>
+            <option value="720">last 30 d</option>
+          </select>
+        </label>
+        <button id="activity-refresh">Refresh</button>
+        <span class="muted" id="activity-stats"></span>
+      </div>
+
+      <h3>Client IPs <span class="muted" id="activity-count"></span></h3>
+      <table id="activity-table">
+        <thead>
+          <tr>
+            <th data-sort="client_ip">Client IP</th>
+            <th data-sort="country">Country</th>
+            <th data-sort="top_host">Domain</th>
+            <th data-sort="total">Requests</th>
+            <th data-sort="c4xx">4xx</th>
+            <th data-sort="c404">404</th>
+            <th data-sort="probes">Probes</th>
+            <th data-sort="hosts">Hosts</th>
+            <th data-sort="last_seen">Last seen</th>
+            <th data-sort="suspicion">Flags</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="activity-body"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+      </table>
+
+      <details class="recent">
+        <summary>Recent requests</summary>
+        <table id="recent-table">
+          <thead><tr><th>Time</th><th>Client IP</th><th>Host</th><th>Method</th><th>URI</th><th>Status</th></tr></thead>
+          <tbody id="recent-body"></tbody>
+        </table>
+      </details>
+    </div>
+
+    <div id="view-blocklist" hidden>
+      <div class="activity-toolbar">
+        <input type="text" id="gb-ip" class="search" placeholder="IP or CIDR — e.g. 203.0.113.0/24" autocomplete="off">
+        <input type="text" id="gb-note" class="search" placeholder="note (optional)" autocomplete="off">
+        <button id="gb-add" class="danger">Add to blocklist</button>
+        <span class="grow"></span>
+        <button id="blocklist-refresh">Refresh</button>
+      </div>
+      <h3>Global blocklist <span class="muted" id="blocklist-count"></span></h3>
+      <p class="hint">These IPs / CIDRs are rejected for <strong>every host</strong>, ahead of all rules. Real visitor IP is matched even behind Cloudflare.</p>
+      <table id="blocklist-table">
+        <thead><tr><th>IP / CIDR</th><th>Added</th><th>Note</th><th></th></tr></thead>
+        <tbody id="blocklist-body"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
   </main>
 
   <dialog id="editor">
@@ -97,15 +196,18 @@
         </label>
       </div>
 
-      <label>Blocked IPs / CIDRs
-        <textarea name="deny_ips" rows="3" placeholder="One per line — e.g.&#10;203.0.113.0/24&#10;198.51.100.7   # noisy bot&#10;2001:db8::/32"></textarea>
-        <span class="hint">Requests from these addresses are blocked. Real visitor IP is used even behind Cloudflare. <code>#</code> starts a comment.</span>
-      </label>
-
-      <label>Redirect blocked IPs to
-        <input name="deny_redirect" placeholder="https://example.com/blocked — leave empty to show a plain 403">
-        <span class="hint">If set, blocked visitors get a 302 redirect here instead of the plain Forbidden page.</span>
-      </label>
+      <fieldset>
+        <legend>IP access control</legend>
+        <label><input type="radio" name="access_mode" value="blacklist" checked> Blacklist — block the listed IPs, allow everyone else</label>
+        <label><input type="radio" name="access_mode" value="whitelist"> Whitelist — allow ONLY the listed IPs, block everyone else</label>
+        <label>IPs / CIDRs
+          <textarea name="deny_ips" rows="3" placeholder="One per line — e.g.&#10;203.0.113.0/24&#10;198.51.100.7   # office&#10;2001:db8::/32"></textarea>
+        </label>
+        <label>Redirect rejected visitors to
+          <input name="deny_redirect" placeholder="https://example.com/blocked — leave empty for a plain 403">
+        </label>
+        <span class="hint">Real visitor IP is used even behind Cloudflare. <code>#</code> starts a comment. An <strong>empty list disables access control</strong> regardless of mode.</span>
+      </fieldset>
 
       <label>Notes
         <textarea name="notes" rows="2" placeholder="optional"></textarea>
@@ -114,6 +216,35 @@
       <div class="dialog-actions">
         <button type="button" id="editor-cancel">Cancel</button>
         <button type="submit" class="primary" id="editor-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="ip-detail">
+    <div class="ip-detail-head">
+      <h2 id="ip-detail-title">IP detail</h2>
+      <button id="ip-detail-close" title="Close">✕</button>
+    </div>
+    <div id="ip-detail-body" class="ip-detail-body">Loading…</div>
+  </dialog>
+
+  <dialog id="password-dialog">
+    <form id="password-form" method="dialog">
+      <h2>Change admin password</h2>
+      <div id="password-error" class="error" hidden></div>
+      <label>Current password
+        <input name="current_password" type="password" autocomplete="current-password" required>
+      </label>
+      <label>New password
+        <input name="new_password" type="password" autocomplete="new-password" minlength="8" required>
+      </label>
+      <label>Confirm new password
+        <input name="confirm_password" type="password" autocomplete="new-password" minlength="8" required>
+      </label>
+      <span class="hint">At least 8 characters.</span>
+      <div class="dialog-actions">
+        <button type="button" id="password-cancel">Cancel</button>
+        <button type="submit" class="primary" id="password-save">Change password</button>
       </div>
     </form>
   </dialog>

@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "import": "node scripts/import-synology.js",
+    "reset-password": "node scripts/reset-password.js",
     "test": "node --test src/caddy.test.js"
   },
   "engines": {

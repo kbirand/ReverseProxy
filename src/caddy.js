@@ -6,6 +6,7 @@ const path = require('node:path');
 const DEFAULT_FALLBACK_UPSTREAM = process.env.FALLBACK_UPSTREAM
   || (process.env.APACHE_PORT ? `127.0.0.1:${process.env.APACHE_PORT}` : '');
 const DEFAULT_CERT_DIR = process.env.CERT_DIR || '/etc/rproxy/certs';
+const DEFAULT_ACCESS_LOG = process.env.ACCESS_LOG || '/var/log/rproxy/access.log';
 const DEFAULT_ADMIN = process.env.CADDY_ADMIN || 'http://127.0.0.1:2019';
 const DEFAULT_DNS_PROVIDER = process.env.ACME_DNS_PROVIDER || ''; // 'cloudflare' enables DNS-01
 const DEFAULT_ACME_EMAIL = process.env.ACME_EMAIL || '';
@@ -47,13 +48,18 @@ function parseIpList(text) {
     .filter(Boolean);
 }
 
-// A route for blocklisted client IPs hitting this rule's hostname(s). Placed
-// BEFORE the rule's proxy route so it wins. Returns null when the rule has no
-// blocklist. If deny_redirect is set, blocked IPs get a 302 to that URL;
-// otherwise they get a plain 403.
-function buildDenyRoute(rule) {
+// An IP access-control route placed BEFORE the rule's proxy route so it wins.
+// Returns null when the rule's IP list is empty (access control disabled,
+// regardless of mode — an empty whitelist would otherwise block everyone).
+//
+//   access_mode 'blacklist' -> reject requests whose client IP IS listed
+//   access_mode 'whitelist' -> reject requests whose client IP is NOT listed
+//
+// Rejected requests get a 302 to deny_redirect if set, otherwise a plain 403.
+function buildAclRoute(rule) {
   const ranges = parseIpList(rule.deny_ips);
   if (!ranges.length) return null;
+  const whitelist = rule.access_mode === 'whitelist';
   const redirect = (rule.deny_redirect || '').trim();
   const handler = redirect
     ? {
@@ -67,8 +73,13 @@ function buildDenyRoute(rule) {
         headers: { 'Content-Type': ['text/plain; charset=utf-8'] },
         body: 'Forbidden\n',
       };
+  // Whitelist: match host AND NOT(client_ip in list) -> reject the unlisted.
+  // Blacklist: match host AND client_ip in list      -> reject the listed.
+  const matcher = whitelist
+    ? { host: hostsFor(rule), not: [{ client_ip: { ranges } }] }
+    : { host: hostsFor(rule), client_ip: { ranges } };
   return {
-    match: [{ host: hostsFor(rule), client_ip: { ranges } }],
+    match: [matcher],
     handle: [handler],
     terminal: true,
   };
@@ -230,12 +241,33 @@ function renderConfig(rules, opts = {}) {
   const fallbackUpstream = opts.fallbackUpstream !== undefined
     ? opts.fallbackUpstream : DEFAULT_FALLBACK_UPSTREAM;
   const certDir = opts.certDir || DEFAULT_CERT_DIR;
+  const accessLogPath = opts.accessLogPath || DEFAULT_ACCESS_LOG;
   const dnsProvider = opts.dnsProvider !== undefined ? opts.dnsProvider : DEFAULT_DNS_PROVIDER;
   const acmeEmail = opts.acmeEmail !== undefined ? opts.acmeEmail : DEFAULT_ACME_EMAIL;
+  const globalBlocks = parseIpList((opts.globalBlocks || []).join('\n'));
   const enabled = rules.filter((r) => r.enabled);
 
   const httpRoutes = [];
   const httpsRoutes = [];
+
+  // Global blocklist: reject these client IPs for ANY host, ahead of every
+  // rule. Used by the activity view's one-click block of suspicious IPs.
+  if (globalBlocks.length) {
+    const blockRoute = {
+      match: [{ client_ip: { ranges: globalBlocks } }],
+      handle: [
+        {
+          handler: 'static_response',
+          status_code: 403,
+          headers: { 'Content-Type': ['text/plain; charset=utf-8'] },
+          body: 'Forbidden\n',
+        },
+      ],
+      terminal: true,
+    };
+    httpRoutes.push(blockRoute);
+    httpsRoutes.push(blockRoute);
+  }
 
   // Match the Synology DSM behavior: serve both :80 and :443 for every rule
   // (when the rule has TLS), routed to the same backend. No automatic
@@ -244,13 +276,13 @@ function renderConfig(rules, opts = {}) {
   // hostname via https:// still get TLS at the edge (CF) regardless.
   for (const rule of enabled) {
     const route = buildRouteForRule(rule, certDir);
-    const denyRoute = buildDenyRoute(rule); // null when no blocklist
-    // Deny route must precede the proxy route so a blocked IP is rejected
+    const aclRoute = buildAclRoute(rule); // null when IP list is empty
+    // ACL route must precede the proxy route so a rejected IP is stopped
     // before it can be proxied. Non-http rules live on both :80 and :443.
-    if (denyRoute) httpRoutes.push(denyRoute);
+    if (aclRoute) httpRoutes.push(aclRoute);
     httpRoutes.push(route);
     if (rule.tls_mode !== 'http') {
-      if (denyRoute) httpsRoutes.push(denyRoute);
+      if (aclRoute) httpsRoutes.push(aclRoute);
       httpsRoutes.push(route);
     }
   }
@@ -300,11 +332,14 @@ function renderConfig(rules, opts = {}) {
   // per-rule IP blocklists) resolves the real visitor IP from X-Forwarded-For.
   const trustedProxies = { source: 'static', ranges: CLOUDFLARE_IPS };
 
+  // `logs: {}` enables per-server access logging to logger
+  // `http.log.access.<server>`, which the `access` log below captures to file.
   const servers = {
     srv_http: {
       listen: [':80'],
       routes: httpRoutes,
       trusted_proxies: trustedProxies,
+      logs: {},
       automatic_https: { disable_redirects: true },
     },
   };
@@ -314,11 +349,17 @@ function renderConfig(rules, opts = {}) {
       listen: [':443'],
       routes: httpsRoutes,
       trusted_proxies: trustedProxies,
+      logs: {},
     };
     if (tlsConnPolicies.length) {
       servers.srv_https.tls_connection_policies = tlsConnPolicies;
     }
   }
+
+  // Caddy emits per-server access logs to the logger named `http.log.access`
+  // (no per-server suffix). Capture that namespace into the access file and
+  // exclude it from the default log so it doesn't also hit journald.
+  const accessNamespaces = ['http.log.access'];
 
   const config = {
     admin: {
@@ -330,7 +371,20 @@ function renderConfig(rules, opts = {}) {
     },
     logging: {
       logs: {
-        default: { level: 'INFO' },
+        // Keep access logs out of journald; route them to their own JSON file.
+        default: { level: 'INFO', exclude: accessNamespaces },
+        access: {
+          writer: {
+            output: 'file',
+            filename: accessLogPath,
+            roll_size_mb: 20,
+            roll_keep: 3,
+            mode: '0640',
+          },
+          encoder: { format: 'json' },
+          include: accessNamespaces,
+          level: 'INFO',
+        },
       },
     },
     apps: {
@@ -391,5 +445,6 @@ module.exports = {
   caddyHealthy,
   DEFAULT_FALLBACK_UPSTREAM,
   DEFAULT_CERT_DIR,
+  DEFAULT_ACCESS_LOG,
   DEFAULT_ADMIN,
 };
