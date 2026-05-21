@@ -1,0 +1,3 @@
+# Normalize all text files to LF line endings — this project is developed and
+# deployed on Linux; consistent EOLs avoid noisy diffs across machines.
+* text=eol=lf
