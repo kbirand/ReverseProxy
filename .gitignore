@@ -1,0 +1,14 @@
+node_modules/
+data/
+*.db
+*.db-journal
+*.log
+.env
+*.env
+
+# Per-machine installer config (copy of install.conf.example).
+install.conf
+
+# Personal infrastructure runbook — internal IPs, NAS, router rule numbers.
+# Kept local, not published.
+ROUTER-CUTOVER.md

@@ -1,0 +1,26 @@
+# rproxy installer configuration.
+# Copy to install.conf and edit, then run:  sudo ./install.sh
+# (install.conf is gitignored — it is per-machine.)
+
+# Port the admin UI listens on (LAN-accessible).
+UI_PORT=8080
+
+# Bind address for the UI. 0.0.0.0 = reachable from the LAN.
+# Use 127.0.0.1 to restrict the UI to this machine only.
+UI_BIND=0.0.0.0
+
+# Optional fallback upstream (host:port) for requests that hit this box by
+# bare IP / loopback but match no rule — e.g. a pre-existing Apache or nginx
+# serving a local dashboard. Leave EMPTY for none (unmatched -> clean 404).
+#   example: FALLBACK_UPSTREAM=127.0.0.1:8081
+FALLBACK_UPSTREAM=
+
+# ACME challenge method for Let's Encrypt certificates:
+#   cloudflare  -> DNS-01 via the Cloudflare API (works even when port 80 is
+#                  not publicly reachable; needs a Cloudflare API token).
+#   (empty)     -> HTTP-01 (Caddy default; needs inbound :80 from the internet).
+ACME_DNS_PROVIDER=cloudflare
+
+# Email registered with Let's Encrypt (expiry notices if auto-renewal fails).
+# Optional but recommended.
+ACME_EMAIL=

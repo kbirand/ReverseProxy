@@ -1,0 +1,22 @@
+# Bootstrap Caddyfile -- loaded once at startup, before the Node UI takes over
+# via the admin API at 127.0.0.1:2019.
+#
+# Provides:
+#   * admin API on 127.0.0.1:2019 (used by rproxy-ui)
+#   * a :80 fallback site that proxies to Apache on 127.0.0.1:8081 so
+#     http://192.168.1.99/proxysql/ keeps working even before any user
+#     rules are pushed.
+#
+# After rproxy-ui pushes its first config, the runtime config replaces this
+# bootstrap entirely.
+
+{
+	admin 127.0.0.1:2019 {
+		origins 127.0.0.1:2019 localhost:2019 [::1]:2019
+	}
+	auto_https disable_redirects
+}
+
+:80 {
+	reverse_proxy 127.0.0.1:8081
+}

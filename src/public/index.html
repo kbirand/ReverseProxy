@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rproxy — reverse proxy admin</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">rproxy</div>
+    <div class="status" id="status">…</div>
+    <input type="search" id="search" class="search" placeholder="Filter — try *.com or api* or 3001"
+           autocomplete="off" spellcheck="false">
+    <div class="actions">
+      <button id="btn-copy" title="Copy detailed rule list to clipboard (for sharing with AI assistants)">Copy details</button>
+      <button id="btn-new" class="primary">+ New rule</button>
+      <button id="btn-reload">Reload Caddy</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="error" class="error" hidden></section>
+    <table id="rules-table">
+      <thead>
+        <tr>
+          <th data-sort="enabled">Enabled</th>
+          <th data-sort="hostname">Hostname</th>
+          <th data-sort="backend_host">Backend</th>
+          <th data-sort="backend_port">Port</th>
+          <th data-sort="tls_mode">TLS</th>
+          <th data-sort="cert_days">Cert expiry</th>
+          <th data-sort="add_www">www</th>
+          <th data-sort="websocket">WS</th>
+          <th data-sort="hsts">HSTS</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="rules-body">
+        <tr><td colspan="10" class="muted">Loading…</td></tr>
+      </tbody>
+    </table>
+  </main>
+
+  <dialog id="editor">
+    <form id="editor-form" method="dialog">
+      <h2 id="editor-title">New rule</h2>
+      <input type="hidden" name="id">
+
+      <label>Hostname
+        <input name="hostname" required placeholder="example.com" autocomplete="off">
+      </label>
+
+      <div class="row">
+        <label class="grow">Backend host
+          <input name="backend_host" required value="127.0.0.1" autocomplete="off">
+        </label>
+        <label>Port
+          <input name="backend_port" required type="number" min="1" max="65535" value="3000">
+        </label>
+      </div>
+
+      <label class="checkbox">
+        <input type="checkbox" name="backend_tls"> backend speaks HTTPS (skip verify)
+      </label>
+
+      <label class="checkbox">
+        <input type="checkbox" name="add_www"> also serve <code>www.&lt;hostname&gt;</code>
+      </label>
+
+      <fieldset>
+        <legend>TLS mode</legend>
+        <label><input type="radio" name="tls_mode" value="http" checked> HTTP only (default for Cloudflare-proxied)</label>
+        <label><input type="radio" name="tls_mode" value="self"> Self-signed (Caddy internal CA — for Cloudflare "Full")</label>
+        <label><input type="radio" name="tls_mode" value="letsencrypt"> Let's Encrypt (public cert via HTTP-01)</label>
+        <label><input type="radio" name="tls_mode" value="manual"> Manual cert file</label>
+        <label class="indent">cert dir
+          <input name="cert_path" placeholder="/etc/rproxy/certs/example.com/">
+        </label>
+      </fieldset>
+
+      <div class="row">
+        <label class="checkbox grow">
+          <input type="checkbox" name="websocket"> WebSocket headers (Upgrade / Connection)
+        </label>
+        <label class="checkbox grow">
+          <input type="checkbox" name="hsts"> HSTS (only when TLS is on)
+        </label>
+      </div>
+
+      <div class="row">
+        <label>Read timeout (seconds)
+          <input name="read_timeout" type="number" min="1" max="3600" value="60">
+        </label>
+        <label class="checkbox grow">
+          <input type="checkbox" name="enabled" checked> Enabled
+        </label>
+      </div>
+
+      <label>Blocked IPs / CIDRs
+        <textarea name="deny_ips" rows="3" placeholder="One per line — e.g.&#10;203.0.113.0/24&#10;198.51.100.7   # noisy bot&#10;2001:db8::/32"></textarea>
+        <span class="hint">Requests from these addresses are blocked. Real visitor IP is used even behind Cloudflare. <code>#</code> starts a comment.</span>
+      </label>
+
+      <label>Redirect blocked IPs to
+        <input name="deny_redirect" placeholder="https://example.com/blocked — leave empty to show a plain 403">
+        <span class="hint">If set, blocked visitors get a 302 redirect here instead of the plain Forbidden page.</span>
+      </label>
+
+      <label>Notes
+        <textarea name="notes" rows="2" placeholder="optional"></textarea>
+      </label>
+
+      <div class="dialog-actions">
+        <button type="button" id="editor-cancel">Cancel</button>
+        <button type="submit" class="primary" id="editor-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

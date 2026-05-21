@@ -1,0 +1,19 @@
+{
+  "name": "rproxy-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reverse-proxy management UI on top of Caddy. SQLite source-of-truth, hot-reload via Caddy admin API.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "import": "node scripts/import-synology.js",
+    "test": "node --test src/caddy.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.19.2"
+  }
+}
