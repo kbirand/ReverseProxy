@@ -4,8 +4,7 @@ A small self-hosted reverse-proxy manager: **[Caddy](https://caddyserver.com/)**
 does the proxying, a lightweight **Node.js + SQLite** web UI manages the rules.
 No Docker, no framework bloat — installs natively via `systemd`.
 
-Built to replace a Synology DSM reverse proxy, but it works in front of any
-set of HTTP backends.
+Works in front of any set of HTTP backends.
 
 ## Features
 
@@ -188,12 +187,6 @@ cd ReverseProxy && git pull && sudo ./install.sh
 - To move to a new machine: install fresh, then copy `rules.db` into place
   (`sudo systemctl stop rproxy-ui`, copy, `chown rproxy:rproxy`, start) and
   hit "Reload" in the UI.
-
-## Migrating from Synology DSM
-
-`scripts/import-synology.js` reads a DSM reverse-proxy export and seeds the
-database. See the comments at the top of that file. (Optional — only useful
-if you are coming from a Synology.)
 
 ## Service management
 
