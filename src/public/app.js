@@ -945,6 +945,9 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#login-form').addEventListener('submit', onLogin);
   $('#btn-logout').addEventListener('click', onLogout);
   $('#btn-password').addEventListener('click', openPasswordDialog);
+  $('#btn-backup').addEventListener('click', openBackupDialog);
+  $('#backup-close').addEventListener('click', () => $('#backup-dialog').close());
+  $('#restore-btn').addEventListener('click', onRestore);
   $('#password-cancel').addEventListener('click', () => $('#password-dialog').close());
   $('#password-form').addEventListener('submit', onChangePassword);
   $('#pw-warning-change').addEventListener('click', openPasswordDialog);
@@ -1027,6 +1030,44 @@ function openPasswordDialog() {
   f.reset();
   $('#password-error').hidden = true;
   $('#password-dialog').showModal();
+}
+
+function openBackupDialog() {
+  $('#backup-error').hidden = true;
+  $('#restore-file').value = '';
+  $('#backup-dialog').showModal();
+}
+
+async function onRestore() {
+  const err = $('#backup-error');
+  err.hidden = true;
+  const file = $('#restore-file').files && $('#restore-file').files[0];
+  if (!file) { err.textContent = 'Choose a backup file first.'; err.hidden = false; return; }
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch {
+    err.textContent = 'That file is not valid JSON.';
+    err.hidden = false;
+    return;
+  }
+  if (!data || data.format !== 'rproxy-backup') {
+    err.textContent = 'That is not an rproxy backup file.';
+    err.hidden = false;
+    return;
+  }
+  const n = Array.isArray(data.rules) ? data.rules.length : 0;
+  if (!confirm(`Restore ${n} rule(s) from this backup?\n\n`
+    + 'This REPLACES all current rules, the global blocklist, and the login. '
+    + 'You will be logged out and must sign in with the backup’s credentials.')) return;
+  try {
+    const r = await api('POST', '/system/restore', data);
+    alert(`Restored ${r.rules} rule(s) and ${r.blocks} blocklist entr${r.blocks === 1 ? 'y' : 'ies'}. Reloading…`);
+    location.reload();
+  } catch (e) {
+    err.textContent = `Restore failed: ${e.message}`;
+    err.hidden = false;
+  }
 }
 
 async function onChangePassword(ev) {

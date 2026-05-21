@@ -350,6 +350,55 @@ function removeGlobalBlock(db, ip) {
   return db.prepare('DELETE FROM global_blocks WHERE ip = ?').run(ip).changes > 0;
 }
 
+// ---- backup / restore ------------------------------------------------------
+
+// A portable snapshot of everything the UI manages: rules, the global
+// blocklist, and the auth credentials. Transient monitoring tables
+// (access_events, ip_info) are intentionally excluded — they regenerate.
+function exportBackup(db) {
+  return {
+    format: 'rproxy-backup',
+    version: 1,
+    created_at: new Date().toISOString(),
+    rules: db.prepare('SELECT * FROM rules').all(),
+    global_blocks: db.prepare('SELECT * FROM global_blocks').all(),
+    meta: db.prepare("SELECT k, v FROM meta WHERE k LIKE 'auth_%'").all(),
+  };
+}
+
+function tableColumns(db, table) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+}
+
+// Replace rules + global blocklist + auth meta from a backup, atomically.
+// Inserts only columns that exist in the current schema, so a backup made on a
+// slightly older/newer version still restores cleanly.
+function importBackup(db, data) {
+  if (!data || data.format !== 'rproxy-backup' || !Array.isArray(data.rules)) {
+    throw new Error('not a valid rproxy backup file');
+  }
+  const ruleCols = tableColumns(db, 'rules');
+  const blockCols = tableColumns(db, 'global_blocks');
+  const insertRow = (table, cols, row) => {
+    const present = cols.filter((c) => Object.prototype.hasOwnProperty.call(row, c));
+    if (!present.length) return;
+    db.prepare(
+      `INSERT INTO ${table} (${present.join(',')}) VALUES (${present.map(() => '?').join(',')})`,
+    ).run(...present.map((c) => row[c]));
+  };
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM rules').run();
+    db.prepare('DELETE FROM global_blocks').run();
+    for (const r of data.rules) insertRow('rules', ruleCols, r);
+    for (const b of (data.global_blocks || [])) insertRow('global_blocks', blockCols, b);
+    for (const m of (data.meta || [])) {
+      if (m && typeof m.k === 'string' && m.k.startsWith('auth_')) setMeta(db, m.k, m.v);
+    }
+  });
+  tx();
+  return { rules: data.rules.length, blocks: (data.global_blocks || []).length };
+}
+
 module.exports = {
   open,
   listRules,
@@ -373,4 +422,6 @@ module.exports = {
   listGlobalBlocks,
   addGlobalBlock,
   removeGlobalBlock,
+  exportBackup,
+  importBackup,
 };

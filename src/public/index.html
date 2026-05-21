@@ -36,6 +36,7 @@
       <button id="btn-copy" class="rules-only" title="Copy detailed rule list to clipboard (for sharing with AI assistants)">Copy details</button>
       <button id="btn-new" class="primary rules-only">+ New rule</button>
       <button id="btn-reload">Reload Caddy</button>
+      <button id="btn-backup" title="Backup &amp; restore configuration">Backup</button>
       <button id="btn-password" title="Change the admin password">Password</button>
       <button id="btn-logout">Logout</button>
     </div>
@@ -226,6 +227,33 @@
       <button id="ip-detail-close" title="Close">✕</button>
     </div>
     <div id="ip-detail-body" class="ip-detail-body">Loading…</div>
+  </dialog>
+
+  <dialog id="backup-dialog">
+    <form method="dialog">
+      <h2>Backup &amp; restore</h2>
+      <div id="backup-error" class="error" hidden></div>
+
+      <section class="backup-section">
+        <h4>Download a backup</h4>
+        <p class="hint">A single JSON file with every rule, the global blocklist,
+          and the login credentials.</p>
+        <a id="backup-download" class="primary btn-link" href="/api/system/backup">Download backup</a>
+      </section>
+
+      <section class="backup-section">
+        <h4>Restore from a backup</h4>
+        <p class="hint">⚠ Replaces <strong>all</strong> current rules, the global
+          blocklist, and the login. You will be logged out and must sign in with
+          the credentials from the backup.</p>
+        <input type="file" id="restore-file" accept=".json,application/json">
+        <button type="button" id="restore-btn" class="danger">Restore</button>
+      </section>
+
+      <div class="dialog-actions">
+        <button type="button" id="backup-close">Close</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="password-dialog">

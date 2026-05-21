@@ -4,6 +4,7 @@ const db = require('../db');
 const { caddyHealthy, DEFAULT_FALLBACK_UPSTREAM, DEFAULT_CERT_DIR, DEFAULT_ADMIN } = require('../caddy');
 const certs = require('../certs');
 const { checkUpdate } = require('../version');
+const { reloadCaddy } = require('../sync');
 
 // Writing this file is picked up by rproxy-update.path, which starts the
 // privileged rproxy-update.service. Keeps the UI sandbox intact (no sudo).
@@ -50,6 +51,32 @@ function buildRouter(database) {
     } catch (e) {
       res.status(500).json({ error: 'version_check_failed', message: e.message });
     }
+  });
+
+  // Download a full backup (rules + global blocklist + auth) as a JSON file.
+  r.get('/backup', (req, res) => {
+    const data = db.exportBackup(database);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="rproxy-backup-${stamp}.json"`);
+    res.send(JSON.stringify(data, null, 2));
+  });
+
+  // Restore from an uploaded backup — replaces rules, blocklist, and auth,
+  // then reloads Caddy. Destructive; the UI confirms first.
+  r.post('/restore', async (req, res) => {
+    let result;
+    try {
+      result = db.importBackup(database, req.body);
+    } catch (e) {
+      return res.status(400).json({ error: 'bad_backup', message: e.message });
+    }
+    try {
+      await reloadCaddy(database);
+    } catch (e) {
+      return res.status(502).json({ error: 'caddy_rejected', message: e.message, body: e.body });
+    }
+    res.json({ ok: true, ...result });
   });
 
   // Trigger a self-update by dropping the request file. systemd's
