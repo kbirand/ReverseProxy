@@ -71,6 +71,15 @@ CF_ENV="$CONFIG_DIR/cloudflare.env"
 ACCESS_LOG="$LOG_DIR/access.log"
 UPDATE_TRIGGER="$STATE_DIR/.update-requested"
 CADDYFILE="$CONFIG_DIR/Caddyfile"
+# Caddy storage (TLS certs, ACME account, local CA). Pinned here so it survives
+# HOME being empty under launchd and so caddy-helper-macos knows where to look.
+CADDY_STORE="$STATE_DIR/caddy"
+# Privileged helper IPC: UI drops a .caddy-action file, helper plist's
+# WatchPaths fires the helper, helper publishes result back. Mirrors the
+# Linux setup but lives under $BREW_PREFIX/var/rproxy.
+CADDY_STAGING_DIR="$STATE_DIR/staging"
+CADDY_ACTION_FILE="$STATE_DIR/.caddy-action"
+CADDY_RESULT_FILE="$STATE_DIR/.caddy-action-result"
 
 # Custom-built caddy (with cloudflare DNS plugin) goes here; otherwise we use
 # brew's stock caddy from $BREW_PREFIX/bin/caddy.
@@ -142,6 +151,14 @@ install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$CERT_DIR"
 # Both Caddy (root) and the UI ($RUN_USER) write into this dir. Owning it to
 # $RUN_USER works because root can write anywhere regardless of mode.
 install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$LOG_DIR"
+# Caddy's storage tree (TLS certs etc) — owned by root since Caddy runs as
+# root under launchd. Only create it if missing so a restore tarball that
+# was already unpacked here keeps its perms.
+[[ -d "$CADDY_STORE" ]] || install -d -m 0700 -o root -g wheel "$CADDY_STORE"
+# Staging dir for snapshot/restore tarballs. UI ($RUN_USER) writes uploads
+# here; helper (root) reads them. Group-readable so the UI can stream
+# downloads. The action/result files live one level up in $STATE_DIR.
+install -d -m 0750 -o "$RUN_USER" -g "$RUN_GROUP" "$CADDY_STAGING_DIR"
 
 # ---- 4. Node dependencies --------------------------------------------------
 echo "[4/8] Installing Node dependencies ..."
@@ -151,6 +168,24 @@ sudo -u "$RUN_USER" -H "$BREW_PREFIX/bin/npm" install \
 # ---- 5. Caddy bootstrap config ---------------------------------------------
 echo "[5/8] Installing Caddy bootstrap config ..."
 install -m 0644 -o "$RUN_USER" -g "$RUN_GROUP" "$REPO_DIR/etc/Caddyfile.bootstrap" "$CADDYFILE"
+# Pin Caddy's storage location into the bootstrap config (idempotent). Without
+# this, launchd's empty $HOME makes Caddy fall back to "./caddy" relative to
+# WorkingDirectory, which then diverges from where the Node UI's pushed config
+# expects storage to live.
+if ! grep -q '^[[:space:]]*storage[[:space:]]*file_system' "$CADDYFILE"; then
+  awk -v store="$CADDY_STORE" '
+    BEGIN { inserted = 0 }
+    /^\{[[:space:]]*$/ && inserted == 0 {
+      print
+      print "\tstorage file_system " store
+      inserted = 1
+      next
+    }
+    { print }
+  ' "$CADDYFILE" > "$CADDYFILE.tmp" && mv "$CADDYFILE.tmp" "$CADDYFILE"
+  chown "$RUN_USER:$RUN_GROUP" "$CADDYFILE"
+  chmod 0644 "$CADDYFILE"
+fi
 
 # ---- 6. Cloudflare token file (only if cloudflare DNS is selected) ---------
 if [[ "$ACME_DNS_PROVIDER" == "cloudflare" ]]; then
@@ -169,6 +204,7 @@ echo "[7/8] Writing launchd plists ..."
 CADDY_PLIST=/Library/LaunchDaemons/com.rproxy.caddy.plist
 UI_PLIST=/Library/LaunchDaemons/com.rproxy.ui.plist
 UPDATE_PLIST=/Library/LaunchDaemons/com.rproxy.update.plist
+HELPER_PLIST=/Library/LaunchDaemons/com.rproxy.caddy-helper.plist
 
 # Caddy needs the Cloudflare token in its environment (DNS-01 challenge). The
 # brew-bundled launchd plist doesn't know about our env file, so we ship our
@@ -239,6 +275,10 @@ cat > "$UI_PLIST" <<EOF
     <key>AUTH_ENABLED</key><string>$AUTH_ENABLED</string>
     <key>COOKIE_SECURE</key><string>false</string>
     <key>UPDATE_TRIGGER</key><string>$UPDATE_TRIGGER</string>
+    <key>CADDY_STORAGE_DIR</key><string>$CADDY_STORE</string>
+    <key>CADDY_ACTION_FILE</key><string>$CADDY_ACTION_FILE</string>
+    <key>CADDY_RESULT_FILE</key><string>$CADDY_RESULT_FILE</string>
+    <key>CADDY_STAGING_DIR</key><string>$CADDY_STAGING_DIR</string>
     <key>PATH</key><string>$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -281,6 +321,41 @@ cat > "$UPDATE_PLIST" <<EOF
 EOF
 chmod 0644 "$UPDATE_PLIST"
 
+# Privileged Caddy snapshot/restore helper — watches $CADDY_ACTION_FILE and
+# invokes scripts/caddy-helper-macos.sh as root.
+chmod +x "$REPO_DIR/scripts/caddy-helper-macos.sh"
+cat > "$HELPER_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.rproxy.caddy-helper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$REPO_DIR/scripts/caddy-helper-macos.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CADDY_STORE</key><string>$CADDY_STORE</string>
+    <key>CADDY_STAGING_DIR</key><string>$CADDY_STAGING_DIR</string>
+    <key>CADDY_ACTION_FILE</key><string>$CADDY_ACTION_FILE</string>
+    <key>CADDY_RESULT_FILE</key><string>$CADDY_RESULT_FILE</string>
+    <key>UI_USER</key><string>$RUN_USER</string>
+    <key>UI_GROUP</key><string>$RUN_GROUP</string>
+    <key>CADDY_LABEL</key><string>com.rproxy.caddy</string>
+    <key>PATH</key><string>$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WatchPaths</key>
+  <array>
+    <string>$CADDY_ACTION_FILE</string>
+  </array>
+  <key>StandardOutPath</key><string>$LOG_DIR/caddy-helper.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/caddy-helper.err</string>
+</dict>
+</plist>
+EOF
+chmod 0644 "$HELPER_PLIST"
+
 # ---- 8. (re)load launchd services ------------------------------------------
 echo "[8/8] (Re)loading launchd services ..."
 # brew may have started caddy via 'brew services' — stop that so it doesn't
@@ -296,6 +371,7 @@ reload() {
 reload "$CADDY_PLIST"  com.rproxy.caddy
 reload "$UI_PLIST"     com.rproxy.ui
 reload "$UPDATE_PLIST" com.rproxy.update
+reload "$HELPER_PLIST" com.rproxy.caddy-helper
 
 sleep 2
 

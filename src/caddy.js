@@ -7,6 +7,11 @@ const DEFAULT_FALLBACK_UPSTREAM = process.env.FALLBACK_UPSTREAM
   || (process.env.APACHE_PORT ? `127.0.0.1:${process.env.APACHE_PORT}` : '');
 const DEFAULT_CERT_DIR = process.env.CERT_DIR || '/etc/rproxy/certs';
 const DEFAULT_ACCESS_LOG = process.env.ACCESS_LOG || '/var/log/rproxy/access.log';
+// Pin Caddy's storage location instead of relying on HOME-based defaults.
+// On Linux the package puts it at /var/lib/caddy/.local/share/caddy; on
+// macOS the installer points it at /opt/homebrew/var/rproxy/caddy. When
+// unset we leave it out and let Caddy pick its default.
+const DEFAULT_STORAGE_DIR = process.env.CADDY_STORAGE_DIR || '';
 const DEFAULT_ADMIN = process.env.CADDY_ADMIN || 'http://127.0.0.1:2019';
 const DEFAULT_DNS_PROVIDER = process.env.ACME_DNS_PROVIDER || ''; // 'cloudflare' enables DNS-01
 const DEFAULT_ACME_EMAIL = process.env.ACME_EMAIL || '';
@@ -517,6 +522,9 @@ function renderConfig(rules, opts = {}) {
   const accessNamespaces = ['http.log.access'];
 
   const config = {
+    ...(DEFAULT_STORAGE_DIR
+      ? { storage: { module: 'file_system', root: DEFAULT_STORAGE_DIR } }
+      : {}),
     admin: {
       listen: '127.0.0.1:2019',
       // Bound to loopback, so the network boundary is the trust boundary.
