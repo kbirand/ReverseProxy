@@ -36,6 +36,7 @@
       <button id="btn-copy" class="rules-only" title="Copy detailed rule list to clipboard (for sharing with AI assistants)">Copy details</button>
       <button id="btn-new" class="primary rules-only">+ New rule</button>
       <button id="btn-reload">Reload Caddy</button>
+      <button id="btn-maintenance" title="Show a maintenance page on selected domains">Maintenance</button>
       <button id="btn-backup" title="Backup &amp; restore configuration">Backup</button>
       <button id="btn-password" title="Change the admin password">Password</button>
       <button id="btn-logout">Logout</button>
@@ -57,6 +58,14 @@
       <button id="ub-dismiss" class="ub-x" type="button" title="Dismiss">✕</button>
     </div>
     <div id="update-changes" class="update-changes" hidden></div>
+
+    <div id="maintenance-banner" class="maint-banner" hidden>
+      <span class="maint-dot"></span>
+      <span id="maint-banner-text"></span>
+      <span class="grow"></span>
+      <button id="maint-banner-edit" class="ub-link" type="button">edit</button>
+      <button id="maint-banner-stop" type="button">Stop maintenance</button>
+    </div>
 
     <section id="error" class="error" hidden></section>
 
@@ -93,13 +102,25 @@
           </select>
         </label>
         <button id="activity-refresh">Refresh</button>
+        <input type="search" id="activity-search" class="search"
+               placeholder="Filter — IP, country, domain, flag" autocomplete="off" spellcheck="false">
         <span class="muted" id="activity-stats"></span>
+        <span class="grow"></span>
+        <span id="activity-live" class="live-dot off">○ offline</span>
       </div>
 
+      <div id="activity-bulk" class="bulk-bar" hidden>
+        <span id="activity-bulk-count"></span>
+        <div class="bulk-actions">
+          <button id="activity-bulk-block" class="danger">Block selected globally</button>
+          <button id="activity-bulk-clear">Clear</button>
+        </div>
+      </div>
       <h3>Client IPs <span class="muted" id="activity-count"></span></h3>
       <table id="activity-table">
         <thead>
           <tr>
+            <th class="check-col"><input type="checkbox" id="activity-check-all" title="Select all visible IPs"></th>
             <th data-sort="client_ip">Client IP</th>
             <th data-sort="country">Country</th>
             <th data-sort="top_host">Domain</th>
@@ -113,7 +134,7 @@
             <th></th>
           </tr>
         </thead>
-        <tbody id="activity-body"><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+        <tbody id="activity-body"><tr><td colspan="12" class="muted">Loading…</td></tr></tbody>
       </table>
 
       <details class="recent">
@@ -224,9 +245,20 @@
   <dialog id="ip-detail">
     <div class="ip-detail-head">
       <h2 id="ip-detail-title">IP detail</h2>
-      <button id="ip-detail-close" title="Close">✕</button>
+      <div class="head-right">
+        <span id="ip-live" class="live-dot off">○ offline</span>
+        <button id="ip-detail-close" title="Close">✕</button>
+      </div>
     </div>
     <div id="ip-detail-body" class="ip-detail-body">Loading…</div>
+  </dialog>
+
+  <dialog id="host-detail">
+    <div class="ip-detail-head">
+      <h2 id="host-detail-title">Host access log</h2>
+      <button id="host-detail-close" title="Close">✕</button>
+    </div>
+    <div id="host-detail-body" class="ip-detail-body">Loading…</div>
   </dialog>
 
   <dialog id="backup-dialog">
@@ -252,6 +284,52 @@
 
       <div class="dialog-actions">
         <button type="button" id="backup-close">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="maintenance-dialog">
+    <form id="maintenance-form" method="dialog">
+      <h2>Maintenance mode</h2>
+      <p class="hint">Show a minimal "we'll be right back" page with a live
+        countdown instead of routing visitors to the backend. The page is
+        served straight from Caddy, so it works even if the backend is down.</p>
+
+      <div id="maint-status" class="maint-status" hidden></div>
+      <div id="maint-error" class="error" hidden></div>
+
+      <fieldset>
+        <legend>How long</legend>
+        <div class="maint-presets" id="maint-presets">
+          <button type="button" data-min="15">15 min</button>
+          <button type="button" data-min="30">30 min</button>
+          <button type="button" data-min="60">1 h</button>
+          <button type="button" data-min="120">2 h</button>
+          <button type="button" data-min="240">4 h</button>
+          <button type="button" data-min="0">Open-ended</button>
+        </div>
+        <label class="inline maint-until-row">
+          End at
+          <input type="datetime-local" id="maint-until" step="60">
+          <span class="hint" id="maint-until-hint"></span>
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Which domains</legend>
+        <label class="checkbox">
+          <input type="radio" name="maint-scope" value="all" checked> All enabled domains
+        </label>
+        <label class="checkbox">
+          <input type="radio" name="maint-scope" value="some"> Only the domains I pick
+        </label>
+        <div id="maint-host-picker" class="maint-hosts" hidden></div>
+      </fieldset>
+
+      <div class="dialog-actions">
+        <button type="button" id="maint-cancel">Cancel</button>
+        <button type="button" id="maint-stop" class="danger" hidden>Stop maintenance</button>
+        <button type="button" id="maint-start" class="primary">Start maintenance</button>
       </div>
     </form>
   </dialog>

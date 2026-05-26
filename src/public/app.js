@@ -6,9 +6,16 @@ const state = {
   activity: [],
   activityMeta: null,
   activitySort: { key: null, dir: 'desc' },
+  activityFilter: '',
+  activitySelected: new Set(),
+  hostDetail: { host: null, hours: 24, hosts: [], liveCount: 0, total: 0 },
+  ipDetail: { ip: null, hours: 24 },
+  live: { stream: null, connected: false },
   view: 'rules',
   version: null,
   auth: null,
+  maintenance: { active: false, until: null, hosts: [] },
+  maintenanceTick: null,
 };
 
 function compileFilter(pattern) {
@@ -159,7 +166,7 @@ function render() {
           ${r.enabled ? 'on' : 'off'}
         </button>
       </td>
-      <td><strong>${escapeHtml(r.hostname)}</strong>${r.add_www ? ` <span class="muted">+www</span>` : ''}${aclBadge(r)}</td>
+      <td><a href="#" class="host-link" data-action="hostlog" data-host="${escapeHtml(r.hostname)}" title="View the access log for this host"><strong>${escapeHtml(r.hostname)}</strong></a>${r.add_www ? ` <span class="muted">+www</span>` : ''}${aclBadge(r)}</td>
       <td>${escapeHtml(r.backend_host)}${r.backend_tls ? ' <span class="muted">(tls)</span>' : ''}</td>
       <td class="num">${r.backend_port}</td>
       <td>${fmtBadge(r.tls_mode, tlsBadges)}</td>
@@ -314,6 +321,12 @@ async function onSubmit(ev) {
 }
 
 async function onTableClick(ev) {
+  const hostLink = ev.target.closest('a[data-action="hostlog"]');
+  if (hostLink) {
+    ev.preventDefault();
+    openHostDetail(hostLink.dataset.host);
+    return;
+  }
   const btn = ev.target.closest('button[data-action]');
   if (!btn) return;
   const tr = ev.target.closest('tr');
@@ -475,8 +488,8 @@ function switchView(view) {
   if (view === 'blocklist') loadBlocklist();
 }
 
-async function loadActivity() {
-  showError('');
+async function loadActivity(opts = {}) {
+  if (!opts.quiet) showError('');
   const hours = $('#activity-window').value;
   try {
     const [act, rec] = await Promise.all([
@@ -486,7 +499,8 @@ async function loadActivity() {
     renderActivity(act);
     renderRecent(rec.events || []);
   } catch (e) {
-    showError(`Activity load failed: ${e.message}`);
+    if (opts.quiet) console.warn('live activity refresh failed:', e.message);
+    else showError(`Activity load failed: ${e.message}`);
   }
 }
 
@@ -520,12 +534,30 @@ const ACTIVITY_SORT = {
   suspicion: (r) => (r.suspicious ? 1000 : 0) + (r.flags ? r.flags.length : 0),
 };
 
+// Matches an activity row against the search box: IP, country, domain, the
+// rule hostnames it touched, suspicion flags, and blocked state.
+function matchActivity(ip, re) {
+  if (!re) return true;
+  const haystack = [
+    ip.client_ip,
+    ip.country || '',
+    ip.country_code || '',
+    ip.top_host || '',
+    (ip.rules || []).map((r) => r.hostname).join(' '),
+    (ip.flags || []).join(' '),
+    ip.blocked ? 'blocked' : '',
+  ].join(' ').toLowerCase();
+  return re.test(haystack);
+}
+
 function activitySorted() {
+  const re = compileFilter(state.activityFilter);
+  const rows = re ? state.activity.filter((ip) => matchActivity(ip, re)) : state.activity;
   const { key, dir } = state.activitySort;
-  if (!key || !ACTIVITY_SORT[key]) return state.activity; // server order: suspicious first
+  if (!key || !ACTIVITY_SORT[key]) return rows; // server order: suspicious first
   const acc = ACTIVITY_SORT[key];
   const mult = dir === 'desc' ? -1 : 1;
-  return [...state.activity].sort((a, b) => {
+  return [...rows].sort((a, b) => {
     const av = acc(a), bv = acc(b);
     if (av < bv) return -1 * mult;
     if (av > bv) return 1 * mult;
@@ -556,6 +588,11 @@ function onActivityHeaderClick(ev) {
 function renderActivity(data) {
   state.activity = data.ips || [];
   state.activityMeta = { count: data.count, window: data.window_hours, stats: data.stats || {} };
+  // Drop selections for IPs no longer present in the current window.
+  const present = new Set(state.activity.map((ip) => ip.client_ip));
+  for (const ip of [...state.activitySelected]) {
+    if (!present.has(ip)) state.activitySelected.delete(ip);
+  }
   drawActivity();
 }
 
@@ -563,14 +600,21 @@ function drawActivity() {
   renderActivityArrows();
   const m = state.activityMeta || { stats: {} };
   const s = m.stats || {};
-  $('#activity-count').textContent = `(${m.count} in last ${m.window}h)`;
+  const tbody = $('#activity-body');
+  const ips = activitySorted();
+  const filtered = !!compileFilter(state.activityFilter);
+  $('#activity-count').textContent = filtered
+    ? `(${ips.length} of ${m.count} in last ${m.window}h)`
+    : `(${m.count} in last ${m.window}h)`;
   $('#activity-stats').textContent = s.count
     ? `${s.count.toLocaleString()} events stored, oldest ${fmtAgo(s.oldest)}`
     : 'no events captured yet';
-  const tbody = $('#activity-body');
-  const ips = activitySorted();
+  renderLiveIndicators();
   if (!ips.length) {
-    tbody.innerHTML = `<tr><td colspan="11" class="muted">No traffic recorded in this window. The access log fills as requests arrive.</td></tr>`;
+    const msg = filtered
+      ? `No client IPs match <code>${escapeHtml(state.activityFilter)}</code>. Press Esc to clear.`
+      : 'No traffic recorded in this window. The access log fills as requests arrive.';
+    tbody.innerHTML = `<tr><td colspan="12" class="muted">${msg}</td></tr>`;
     return;
   }
   tbody.innerHTML = ips.map((ip) => {
@@ -589,8 +633,10 @@ function drawActivity() {
         + `</select>`
         + `<button class="danger" data-act="blockscope" data-ip="${escapeHtml(ip.client_ip)}">Block</button>`;
     }
+    const checked = state.activitySelected.has(ip.client_ip) ? ' checked' : '';
     return `
       <tr class="${ip.suspicious ? 'suspicious' : ''}">
+        <td class="check-col"><input type="checkbox" class="row-check" data-ip="${escapeHtml(ip.client_ip)}"${checked}></td>
         <td class="ip">
           <a href="#" data-act="detail" data-ip="${escapeHtml(ip.client_ip)}">${escapeHtml(ip.client_ip)}</a>
           ${ip.blocked ? ' <span class="badge cert-crit">blocked</span>' : ''}
@@ -607,6 +653,63 @@ function drawActivity() {
         <td class="row-actions">${action}</td>
       </tr>`;
   }).join('');
+  updateActivityBulkBar();
+}
+
+// ---- activity multi-select -------------------------------------------------
+
+function updateActivityBulkBar() {
+  const n = state.activitySelected.size;
+  const bar = $('#activity-bulk');
+  if (bar) {
+    bar.hidden = n === 0;
+    const cnt = $('#activity-bulk-count');
+    if (cnt) cnt.textContent = `${n} IP${n === 1 ? '' : 's'} selected`;
+  }
+  const all = $('#activity-check-all');
+  if (all) {
+    const visible = activitySorted();
+    const sel = visible.filter((ip) => state.activitySelected.has(ip.client_ip)).length;
+    all.checked = visible.length > 0 && sel === visible.length;
+    all.indeterminate = sel > 0 && sel < visible.length;
+  }
+}
+
+function onActivitySelectChange(ev) {
+  const cb = ev.target.closest('input.row-check');
+  if (!cb) return;
+  if (cb.checked) state.activitySelected.add(cb.dataset.ip);
+  else state.activitySelected.delete(cb.dataset.ip);
+  updateActivityBulkBar();
+}
+
+// Header checkbox — select/deselect every IP currently visible (i.e. matching
+// the search filter), not the whole window.
+function onActivityToggleAll(ev) {
+  for (const ip of activitySorted()) {
+    if (ev.target.checked) state.activitySelected.add(ip.client_ip);
+    else state.activitySelected.delete(ip.client_ip);
+  }
+  drawActivity();
+}
+
+function clearActivitySelection() {
+  state.activitySelected.clear();
+  drawActivity();
+}
+
+async function onActivityBulkBlock() {
+  const ips = [...state.activitySelected];
+  if (!ips.length) return;
+  if (!confirm(`Block ${ips.length} IP${ips.length === 1 ? '' : 's'} globally?\n\n`
+    + 'They will be rejected for every host, ahead of all rules.')) return;
+  try {
+    await api('POST', '/activity/blocklist/bulk', { ips, note: 'bulk block from activity' });
+    state.activitySelected.clear();
+    await loadActivity();
+  } catch (e) {
+    showError(`Bulk block failed: ${e.message}`);
+  }
 }
 
 function renderBlocklist(blocks) {
@@ -700,6 +803,20 @@ function miniTable(rows) {
   return `<table class="mini">${rows.join('')}</table>`;
 }
 
+// Top-paths table shared by the IP- and host-detail dialogs. Each row is
+// prefixed with the host the path was requested on, so a path is never
+// ambiguous when an IP — or a host's www. alias — spans multiple hostnames.
+function pathsTable(paths) {
+  return miniTable(paths.map((p) => {
+    const host = p.host || '—';
+    return `<tr><td class="uri" title="${escapeHtml(host + ' ' + p.uri)}">`
+      + `<span class="path-host">${escapeHtml(host)}</span> ${escapeHtml(p.uri)}`
+      + `${p.probe ? ' <span class="flag">probe</span>' : ''}</td>`
+      + `<td class="num">${p.c}</td>`
+      + `<td class="num ${p.errors ? 'st4' : ''}">${p.errors || ''}</td></tr>`;
+  }));
+}
+
 function renderIpDetail(d) {
   const info = d.info || {};
   const s = d.summary || {};
@@ -737,9 +854,7 @@ function renderIpDetail(d) {
   const hosts = miniTable(d.hosts.map((h) =>
     `<tr><td>${escapeHtml(h.host)}</td><td class="num">${h.c}</td></tr>`));
 
-  const paths = miniTable(d.paths.map((p) =>
-    `<tr><td class="uri" title="${escapeHtml(p.uri)}">${escapeHtml(p.uri)}${p.probe ? ' <span class="flag">probe</span>' : ''}</td>`
-    + `<td class="num">${p.c}</td><td class="num ${p.errors ? 'st4' : ''}">${p.errors || ''}</td></tr>`));
+  const paths = pathsTable(d.paths);
 
   const methods = d.methods.map((m) => `${escapeHtml(m.method || '?')}×${m.c}`).join('  ');
   const statuses = d.statuses.map((x) => `<span class="st${String(x.status).charAt(0)}">${x.status}×${x.c}</span>`).join('  ');
@@ -776,11 +891,13 @@ function renderIpDetail(d) {
 }
 
 async function openIpDetail(ip) {
+  const hours = $('#activity-window').value;
+  state.ipDetail = { ip, hours };
   $('#ip-detail-title').textContent = ip;
   $('#ip-detail-body').innerHTML = '<div class="muted">Looking up geolocation &amp; activity…</div>';
   $('#ip-detail').showModal();
+  renderLiveIndicators();
   try {
-    const hours = $('#activity-window').value;
     const d = await api('GET', `/activity/ip/${encodeURIComponent(ip)}?hours=${hours}`);
     renderIpDetail(d);
   } catch (e) {
@@ -810,6 +927,260 @@ async function onIpDetailClick(ev) {
   }
 }
 
+// ---- host access log -------------------------------------------------------
+
+const HOST_WINDOWS = [[1, 'last 1 h'], [24, 'last 24 h'], [168, 'last 7 d'], [720, 'last 30 d']];
+
+function hostWindowSelect(hours) {
+  return `<select id="host-detail-window">`
+    + HOST_WINDOWS.map(([v, l]) =>
+        `<option value="${v}"${v === hours ? ' selected' : ''}>${l}</option>`).join('')
+    + `</select>`;
+}
+
+function renderHostDetail(d) {
+  state.hostDetail.hosts = (d.hosts && d.hosts.length) ? d.hosts : [d.host];
+  const hours = state.hostDetail.hours;
+  $('#host-detail-title').textContent = d.host;
+  const others = (d.hosts || []).filter((h) => h !== d.host);
+  const aliasNote = others.length
+    ? ` <span class="muted">+ ${others.map(escapeHtml).join(', ')}</span>` : '';
+  const toolbar = `<div class="activity-toolbar">`
+    + `<label class="inline">Window ${hostWindowSelect(hours)}</label>${aliasNote}`
+    + `<span class="grow"></span>`
+    + `<span id="host-live" class="live-dot off">○ offline</span></div>`;
+  const recentRows = d.recent.map((e) => recentRowHtml(e)).join('');
+
+  $('#host-detail-body').innerHTML = toolbar
+    + `<div id="host-aggregates">${hostAggregatesHtml(d)}</div>`
+    + `<section><h4>Recent requests</h4>`
+    + `<table class="mini" id="host-recent">${recentRows
+        || '<tr><td class="muted">No requests yet — new ones stream in here live.</td></tr>'}</table>`
+    + `</section>`;
+  $('#host-detail-window').addEventListener('change', onHostWindowChange);
+  renderLiveIndicators();
+}
+
+// The aggregate sections (summary, client IPs, paths, methods, statuses).
+// Split out so the live refresh can replace them without disturbing the
+// SSE-fed Recent-requests table below. Side effect: re-baselines the live
+// counters to this snapshot.
+function hostAggregatesHtml(d) {
+  const s = d.summary || {};
+  state.hostDetail.total = s.total || 0;
+  state.hostDetail.liveCount = 0;
+
+  const summary = [
+    `<div class="kv"><span class="kv-k">Requests</span>`
+      + `<span class="kv-v" id="host-sum-total">${s.total || 0} in last ${d.window_hours}h</span></div>`,
+    kvRow('First seen', s.first_seen ? new Date(s.first_seen).toLocaleString() : '—'),
+    `<div class="kv"><span class="kv-k">Last seen</span>`
+      + `<span class="kv-v" id="host-sum-last">`
+      + `${s.last_seen ? `${new Date(s.last_seen).toLocaleString()} (${fmtAgo(s.last_seen)})` : '—'}</span></div>`,
+    kvRow('Errors', `${s.c4xx || 0} × 4xx · ${s.c404 || 0} × 404 · ${s.c5xx || 0} × 5xx`),
+    kvRow('Probe-path hits', String(s.probes || 0)),
+    kvRow('Distinct client IPs', String(s.ips || 0)),
+  ].join('');
+
+  const clients = miniTable(d.clients.map((c) => {
+    const cc = c.info && c.info.country_code;
+    const loc = cc ? ` ${flagEmoji(cc)} ${escapeHtml(cc)}` : '';
+    const cls = c.blocked ? ' class="ip-blocked"' : '';
+    const badge = c.blocked ? ' <span class="badge cert-crit">blocked</span>' : '';
+    return `<tr>`
+      + `<td class="ip"><a href="#"${cls} data-host-ip="${escapeHtml(c.client_ip)}">${escapeHtml(c.client_ip)}</a>${loc}${badge}</td>`
+      + `<td class="num">${c.c}</td>`
+      + `<td class="num ${c.errors ? 'st4' : ''}">${c.errors || ''}</td>`
+      + `<td class="num">${c.probes || ''}</td>`
+      + `<td>${fmtAgo(c.last_seen)}</td></tr>`;
+  }));
+
+  const paths = pathsTable(d.paths);
+  const methods = d.methods.map((m) => `${escapeHtml(m.method || '?')}×${m.c}`).join('  ');
+  const statuses = d.statuses.map((x) => `<span class="st${String(x.status).charAt(0)}">${x.status}×${x.c}</span>`).join('  ');
+
+  return `
+    <section><h4>Summary</h4>${summary}</section>
+    <section><h4>Client IPs <span class="muted">(top ${d.clients.length})</span></h4>${clients}</section>
+    <section><h4>Top paths</h4>${paths}</section>
+    <div class="detail-grid">
+      <section><h4>Methods</h4><div class="mono">${methods || '—'}</div></section>
+      <section><h4>Status codes</h4><div class="mono">${statuses || '—'}</div></section>
+    </div>`;
+}
+
+// Re-fetch the host snapshot and swap in fresh aggregate sections, leaving the
+// live Recent-requests feed untouched.
+async function refreshHostAggregates() {
+  const { host, hours } = state.hostDetail;
+  if (!host || !$('#host-detail').open) return;
+  try {
+    const d = await api('GET', `/activity/host/${encodeURIComponent(host)}?hours=${hours}`);
+    const box = $('#host-aggregates');
+    if (box) box.innerHTML = hostAggregatesHtml(d);
+    renderLiveIndicators();
+  } catch (_) { /* keep prior content on a transient failure */ }
+}
+
+// One row of the host log's Recent-requests table. `isNew` flags a live
+// arrival so it gets the brief highlight flash.
+function recentRowHtml(e, isNew) {
+  return `<tr${isNew ? ' class="row-new"' : ''}>`
+    + `<td>${new Date(e.ts).toLocaleTimeString()}</td>`
+    + `<td class="ip"><span${e.blocked ? ' class="ip-blocked"' : ''}>${escapeHtml(e.client_ip)}</span></td>`
+    + `<td>${escapeHtml(e.method || '')}</td>`
+    + `<td class="uri" title="${escapeHtml(e.uri || '')}">${escapeHtml(e.uri || '')}${e.suspicious_path ? ' <span class="flag">probe</span>' : ''}</td>`
+    + `<td class="num st${String(e.status).charAt(0)}">${e.status || ''}</td></tr>`;
+}
+
+// Append one live request to the host log's Recent table — instant feedback;
+// the aggregate sections catch up on the debounced refresh.
+function appendHostRecent(e) {
+  const table = $('#host-recent');
+  if (!table) return;
+  const ph = table.querySelector('td.muted');
+  if (ph) ph.closest('tr').remove();
+  table.insertAdjacentHTML('afterbegin', recentRowHtml(e, true));
+  while (table.rows.length > 80) table.deleteRow(table.rows.length - 1);
+
+  state.hostDetail.liveCount += 1;
+  const total = $('#host-sum-total');
+  if (total) {
+    total.textContent =
+      `${state.hostDetail.total + state.hostDetail.liveCount} in last ${state.hostDetail.hours}h`;
+  }
+  const last = $('#host-sum-last');
+  if (last) last.textContent = `${new Date(e.ts).toLocaleString()} (just now)`;
+  renderLiveIndicators();
+}
+
+function hostDetailMatches(host) {
+  return state.hostDetail.hosts.includes(host);
+}
+
+async function loadHostDetail() {
+  const { host, hours } = state.hostDetail;
+  try {
+    const d = await api('GET', `/activity/host/${encodeURIComponent(host)}?hours=${hours}`);
+    renderHostDetail(d);
+  } catch (e) {
+    $('#host-detail-body').innerHTML = `<div class="error">Failed to load: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function onHostWindowChange(ev) {
+  state.hostDetail.hours = Number(ev.target.value);
+  loadHostDetail();
+}
+
+async function openHostDetail(host) {
+  state.hostDetail = { host, hours: 24, hosts: [host], liveCount: 0, total: 0 };
+  $('#host-detail-title').textContent = host;
+  $('#host-detail-body').innerHTML = '<div class="muted">Loading access log…</div>';
+  $('#host-detail').showModal();
+  await loadHostDetail();
+}
+
+// Clicking a client IP inside the host log opens the full IP-detail dialog.
+function onHostDetailClick(ev) {
+  const link = ev.target.closest('a[data-host-ip]');
+  if (!link) return;
+  ev.preventDefault();
+  openIpDetail(link.dataset.hostIp);
+}
+
+// ---- live updates ----------------------------------------------------------
+// One shared SSE connection drives every live view. Whatever is on screen —
+// the Activity page, the IP-detail dialog, the host access log — refreshes
+// when matching traffic arrives, plus a slow heartbeat so idle views stay
+// honest.
+
+const LIVE_DEBOUNCE_MS = 2000;
+const liveTimers = {};
+
+function startLiveStream() {
+  if (state.live.stream) return;
+  let es;
+  try { es = new EventSource('/api/activity/stream'); } catch (_) { return; }
+  state.live.stream = es;
+  es.addEventListener('open', () => { state.live.connected = true; renderLiveIndicators(); });
+  es.addEventListener('error', () => { state.live.connected = false; renderLiveIndicators(); });
+  es.addEventListener('access', onLiveEvent);
+}
+
+function onLiveEvent(ev) {
+  let e;
+  try { e = JSON.parse(ev.data); } catch (_) { return; }
+  if ($('#host-detail').open && hostDetailMatches(e.host)) {
+    appendHostRecent(e);   // instant — append to the recent feed
+    scheduleLive('host');  // debounced — refresh the aggregate sections
+  }
+  if ($('#ip-detail').open && e.client_ip === state.ipDetail.ip) {
+    scheduleLive('ip');
+  }
+  if (state.view === 'activity') {
+    scheduleLive('activity');
+  }
+}
+
+// Coalesce bursts: the first event arms a timer; later events within the
+// window fold into the same refresh.
+function scheduleLive(target) {
+  if (liveTimers[target]) return;
+  liveTimers[target] = setTimeout(() => {
+    liveTimers[target] = null;
+    runLiveRefresh(target);
+  }, LIVE_DEBOUNCE_MS);
+}
+
+function runLiveRefresh(target) {
+  if (target === 'activity') {
+    if (state.view !== 'activity') return;
+    // Don't yank the table out from under an open block-menu / focused control.
+    const ae = document.activeElement;
+    const body = $('#activity-body');
+    if (ae && body && body.contains(ae)) return;
+    loadActivity({ quiet: true });
+  } else if (target === 'host' && $('#host-detail').open) {
+    refreshHostAggregates();
+  } else if (target === 'ip' && $('#ip-detail').open) {
+    refreshIpDetail();
+  }
+}
+
+// Even with no traffic, tick the open views so relative times stay honest.
+function liveHeartbeat() {
+  if ($('#host-detail').open) scheduleLive('host');
+  if ($('#ip-detail').open) scheduleLive('ip');
+  if (state.view === 'activity') scheduleLive('activity');
+}
+
+function renderLiveIndicators() {
+  const on = state.live.connected;
+  const setDot = (el, extra) => {
+    if (!el) return;
+    el.className = on ? 'live-dot' : 'live-dot off';
+    el.textContent = on ? `● live${extra || ''}` : '○ offline';
+  };
+  setDot($('#host-live'), state.hostDetail.liveCount ? ` · ${state.hostDetail.liveCount} new` : '');
+  setDot($('#activity-live'), '');
+  setDot($('#ip-live'), '');
+}
+
+// Re-fetch the IP-detail snapshot in place, preserving scroll position.
+async function refreshIpDetail() {
+  const ip = state.ipDetail.ip;
+  if (!ip || !$('#ip-detail').open) return;
+  const dlg = $('#ip-detail');
+  const keepScroll = dlg.scrollTop;
+  try {
+    const d = await api('GET', `/activity/ip/${encodeURIComponent(ip)}?hours=${state.ipDetail.hours}`);
+    renderIpDetail(d);
+    dlg.scrollTop = keepScroll;
+    renderLiveIndicators();
+  } catch (_) { /* keep prior content on a transient failure */ }
+}
+
 async function onGlobalBlockAdd() {
   const ipEl = $('#gb-ip');
   const noteEl = $('#gb-note');
@@ -822,6 +1193,186 @@ async function onGlobalBlockAdd() {
     ipEl.focus();
   } catch (e) {
     showError(`Add to blocklist failed: ${e.message}`);
+  }
+}
+
+// ---- maintenance mode ------------------------------------------------------
+
+function fmtCountdown(ms) {
+  if (ms <= 0) return 'ending now…';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d) return `${d}d ${h}h ${m}m left`;
+  if (h) return `${h}h ${m}m left`;
+  if (m) return `${m}m ${sec}s left`;
+  return `${sec}s left`;
+}
+
+function renderMaintenanceBanner() {
+  const banner = $('#maintenance-banner');
+  const m = state.maintenance;
+  if (!m || !m.active) {
+    banner.hidden = true;
+    if (state.maintenanceTick) { clearInterval(state.maintenanceTick); state.maintenanceTick = null; }
+    return;
+  }
+  const txt = $('#maint-banner-text');
+  const scope = (m.hosts && m.hosts.length)
+    ? `${m.hosts.length} domain${m.hosts.length === 1 ? '' : 's'}`
+    : 'all domains';
+  if (m.until) {
+    const left = m.until - Date.now();
+    if (left <= 0) {
+      txt.textContent = `Maintenance ending — ${scope}.`;
+    } else {
+      txt.textContent = `Maintenance active on ${scope} — ${fmtCountdown(left)}.`;
+    }
+  } else {
+    txt.textContent = `Maintenance active on ${scope} — open-ended.`;
+  }
+  banner.hidden = false;
+  if (!state.maintenanceTick) {
+    state.maintenanceTick = setInterval(renderMaintenanceBanner, 1000);
+  }
+}
+
+async function refreshMaintenance() {
+  try {
+    const data = await api('GET', '/system/maintenance');
+    state.maintenance = data.maintenance || { active: false, until: null, hosts: [] };
+    renderMaintenanceBanner();
+  } catch (_) { /* best-effort */ }
+}
+
+function toLocalDatetimeInput(ts) {
+  // datetime-local needs YYYY-MM-DDTHH:MM in *local* time.
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    + `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function selectPreset(min) {
+  for (const b of $$('#maint-presets button')) {
+    b.classList.toggle('selected', Number(b.dataset.min) === min);
+  }
+  const until = $('#maint-until');
+  const hint = $('#maint-until-hint');
+  if (min === 0) {
+    until.value = '';
+    hint.textContent = '(no automatic end — stays on until you stop it)';
+  } else {
+    until.value = toLocalDatetimeInput(Date.now() + min * 60_000);
+    hint.textContent = '';
+  }
+}
+
+function renderHostPicker(selected) {
+  const box = $('#maint-host-picker');
+  const enabled = state.rules.filter((r) => r.enabled);
+  if (!enabled.length) {
+    box.innerHTML = '<div class="hint">No enabled rules.</div>';
+    return;
+  }
+  const sel = new Set(selected || []);
+  box.innerHTML = enabled.map((r) => {
+    const hosts = [r.hostname].concat(r.add_www ? [`www.${r.hostname}`] : []);
+    // A rule is "checked" when every one of its hostnames is in the selection.
+    const checked = hosts.every((h) => sel.has(h));
+    return `<label><input type="checkbox" data-hosts="${escapeHtml(hosts.join(','))}"`
+      + `${checked ? ' checked' : ''}> ${escapeHtml(r.hostname)}`
+      + `${r.add_www ? ' <span class="muted">+www</span>' : ''}</label>`;
+  }).join('');
+}
+
+function openMaintenanceDialog() {
+  $('#maint-error').hidden = true;
+  const m = state.maintenance || { active: false, until: null, hosts: [] };
+  const status = $('#maint-status');
+  if (m.active) {
+    const scope = (m.hosts && m.hosts.length)
+      ? `${m.hosts.length} domain${m.hosts.length === 1 ? '' : 's'}`
+      : 'all domains';
+    const tail = m.until ? ` — ${fmtCountdown(m.until - Date.now())}` : ' — open-ended';
+    status.textContent = `Currently active on ${scope}${tail}.`;
+    status.hidden = false;
+    $('#maint-start').textContent = 'Update';
+    $('#maint-stop').hidden = false;
+  } else {
+    status.hidden = true;
+    $('#maint-start').textContent = 'Start maintenance';
+    $('#maint-stop').hidden = true;
+  }
+  // Preselect prior choices, or default to 1 hour / all domains.
+  if (m.until) {
+    $('#maint-until').value = toLocalDatetimeInput(m.until);
+    $('#maint-until-hint').textContent = '';
+    for (const b of $$('#maint-presets button')) b.classList.remove('selected');
+  } else if (m.active) {
+    selectPreset(0);
+  } else {
+    selectPreset(60);
+  }
+  const scopeRadio = m.hosts && m.hosts.length ? 'some' : 'all';
+  for (const r of $$('input[name="maint-scope"]')) r.checked = r.value === scopeRadio;
+  renderHostPicker(m.hosts);
+  $('#maint-host-picker').hidden = scopeRadio !== 'some';
+  $('#maintenance-dialog').showModal();
+}
+
+function readMaintenanceForm() {
+  const scope = document.querySelector('input[name="maint-scope"]:checked').value;
+  let hosts = [];
+  if (scope === 'some') {
+    for (const cb of $$('#maint-host-picker input[type="checkbox"]')) {
+      if (cb.checked) hosts = hosts.concat(cb.dataset.hosts.split(','));
+    }
+  }
+  const v = $('#maint-until').value;
+  const until = v ? new Date(v).getTime() : null;
+  return { active: true, until, hosts };
+}
+
+async function onMaintenanceStart() {
+  const err = $('#maint-error');
+  err.hidden = true;
+  const body = readMaintenanceForm();
+  if (body.until && body.until <= Date.now()) {
+    err.textContent = 'End time must be in the future.';
+    err.hidden = false;
+    return;
+  }
+  const scope = document.querySelector('input[name="maint-scope"]:checked').value;
+  if (scope === 'some' && !body.hosts.length) {
+    err.textContent = 'Pick at least one domain — or switch to All enabled domains.';
+    err.hidden = false;
+    return;
+  }
+  try {
+    const r = await api('POST', '/system/maintenance', body);
+    state.maintenance = r.maintenance;
+    $('#maintenance-dialog').close();
+    renderMaintenanceBanner();
+  } catch (e) {
+    err.textContent = e.message;
+    err.hidden = false;
+  }
+}
+
+async function onMaintenanceStop() {
+  const err = $('#maint-error');
+  err.hidden = true;
+  try {
+    const r = await api('POST', '/system/maintenance', { active: false, until: null, hosts: [] });
+    state.maintenance = r.maintenance;
+    $('#maintenance-dialog').close();
+    renderMaintenanceBanner();
+  } catch (e) {
+    err.textContent = e.message;
+    err.hidden = false;
   }
 }
 
@@ -907,14 +1458,35 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#activity-refresh').addEventListener('click', loadActivity);
   $('#activity-window').addEventListener('change', loadActivity);
   $('#activity-body').addEventListener('click', onActivityClick);
+  $('#activity-body').addEventListener('change', onActivitySelectChange);
   $('#activity-table thead').addEventListener('click', onActivityHeaderClick);
+  $('#activity-check-all').addEventListener('change', onActivityToggleAll);
+  $('#activity-bulk-block').addEventListener('click', onActivityBulkBlock);
+  $('#activity-bulk-clear').addEventListener('click', clearActivitySelection);
+  const activitySearch = $('#activity-search');
+  activitySearch.addEventListener('input', (ev) => {
+    state.activityFilter = ev.target.value;
+    drawActivity();
+  });
+  activitySearch.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      ev.target.value = '';
+      state.activityFilter = '';
+      drawActivity();
+      ev.target.blur();
+    }
+  });
   $('#blocklist-body').addEventListener('click', onActivityClick);
   $('#blocklist-refresh').addEventListener('click', loadBlocklist);
   $('#gb-add').addEventListener('click', onGlobalBlockAdd);
   $('#gb-ip').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') onGlobalBlockAdd(); });
   $('#gb-note').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') onGlobalBlockAdd(); });
   $('#ip-detail-close').addEventListener('click', () => $('#ip-detail').close());
+  $('#ip-detail').addEventListener('close', () => { state.ipDetail.ip = null; });
   $('#ip-detail-body').addEventListener('click', onIpDetailClick);
+  $('#host-detail-close').addEventListener('click', () => $('#host-detail').close());
+  $('#host-detail').addEventListener('close', () => { state.hostDetail.host = null; });
+  $('#host-detail-body').addEventListener('click', onHostDetailClick);
   $('#editor-cancel').addEventListener('click', () => $('#editor').close());
   $('#editor-form').addEventListener('submit', onSubmit);
   $('#rules-body').addEventListener('click', onTableClick);
@@ -945,6 +1517,26 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#login-form').addEventListener('submit', onLogin);
   $('#btn-logout').addEventListener('click', onLogout);
   $('#btn-password').addEventListener('click', openPasswordDialog);
+  $('#btn-maintenance').addEventListener('click', openMaintenanceDialog);
+  $('#maint-cancel').addEventListener('click', () => $('#maintenance-dialog').close());
+  $('#maint-start').addEventListener('click', onMaintenanceStart);
+  $('#maint-stop').addEventListener('click', onMaintenanceStop);
+  $('#maint-banner-edit').addEventListener('click', openMaintenanceDialog);
+  $('#maint-banner-stop').addEventListener('click', onMaintenanceStop);
+  $('#maint-presets').addEventListener('click', (ev) => {
+    const b = ev.target.closest('button[data-min]');
+    if (!b) return;
+    selectPreset(Number(b.dataset.min));
+  });
+  $('#maint-until').addEventListener('input', () => {
+    for (const b of $$('#maint-presets button')) b.classList.remove('selected');
+    $('#maint-until-hint').textContent = '';
+  });
+  document.querySelectorAll('input[name="maint-scope"]').forEach((r) => {
+    r.addEventListener('change', () => {
+      $('#maint-host-picker').hidden = r.value !== 'some' || !r.checked;
+    });
+  });
   $('#btn-backup').addEventListener('click', openBackupDialog);
   $('#backup-close').addEventListener('click', () => $('#backup-dialog').close());
   $('#restore-btn').addEventListener('click', onRestore);
@@ -979,10 +1571,14 @@ function startApp() {
   appStarted = true;
   refresh().catch((e) => showError(`Failed to load: ${e.message}`));
   refreshStatus();
+  refreshMaintenance();
   checkVersion();
+  startLiveStream();
   setInterval(refreshStatus, 5000);
+  setInterval(refreshMaintenance, 30_000);
   setInterval(() => refreshCerts(false), 30_000);
   setInterval(() => checkVersion(), 6 * 60 * 60 * 1000);
+  setInterval(liveHeartbeat, 20_000);
 }
 
 async function onLogin(ev) {

@@ -4,7 +4,7 @@ const db = require('../db');
 const { caddyHealthy, DEFAULT_FALLBACK_UPSTREAM, DEFAULT_CERT_DIR, DEFAULT_ADMIN } = require('../caddy');
 const certs = require('../certs');
 const { checkUpdate } = require('../version');
-const { reloadCaddy } = require('../sync');
+const { reloadCaddy, scheduleMaintenanceAutoEnd } = require('../sync');
 
 // Writing this file is picked up by rproxy-update.path, which starts the
 // privileged rproxy-update.service. Keeps the UI sandbox intact (no sudo).
@@ -77,6 +77,38 @@ function buildRouter(database) {
       return res.status(502).json({ error: 'caddy_rejected', message: e.message, body: e.body });
     }
     res.json({ ok: true, ...result });
+  });
+
+  // Read current maintenance state.
+  r.get('/maintenance', (req, res) => {
+    res.json({ maintenance: db.getMaintenance(database) });
+  });
+
+  // Enable / disable / update maintenance mode. Body shape:
+  //   { active: bool, until?: number|null (ms), hosts?: string[] }
+  // Empty hosts array means "every enabled rule".
+  r.post('/maintenance', async (req, res) => {
+    const body = req.body || {};
+    const state = {
+      active: !!body.active,
+      until: body.until ? Number(body.until) : null,
+      hosts: Array.isArray(body.hosts)
+        ? body.hosts.map((s) => String(s).trim()).filter(Boolean)
+        : [],
+    };
+    if (state.active && state.until && state.until <= Date.now()) {
+      return res.status(400).json({ error: 'bad_until', message: 'end time must be in the future' });
+    }
+    const prev = db.getMaintenance(database);
+    db.setMaintenance(database, state);
+    try {
+      await reloadCaddy(database);
+    } catch (e) {
+      db.setMaintenance(database, prev);
+      return res.status(502).json({ error: 'caddy_rejected', message: e.message, body: e.body });
+    }
+    scheduleMaintenanceAutoEnd(database);
+    res.json({ ok: true, maintenance: state });
   });
 
   // Trigger a self-update by dropping the request file. systemd's

@@ -3,7 +3,7 @@ const express = require('express');
 const db = require('./db');
 const auth = require('./auth');
 const { caddyHealthy } = require('./caddy');
-const { reloadCaddy } = require('./sync');
+const { reloadCaddy, scheduleMaintenanceAutoEnd } = require('./sync');
 const { startIngester } = require('./access-log');
 const rulesRoute = require('./routes/rules');
 const systemRoute = require('./routes/system');
@@ -48,6 +48,9 @@ async function syncOnStartup() {
   } catch (e) {
     console.error(`[rproxy-ui] startup sync failed (UI still up, use Reload): ${e.message}`);
   }
+  // Re-arm the maintenance auto-end timer after a restart so an in-progress
+  // window still ends on schedule (or ends immediately if it already passed).
+  scheduleMaintenanceAutoEnd(database);
 }
 
 app.listen(PORT, BIND, () => {

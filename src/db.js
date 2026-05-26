@@ -199,6 +199,33 @@ function getMeta(db, k) {
   return row ? row.v : null;
 }
 
+// ---- maintenance mode ------------------------------------------------------
+
+// Stored as one JSON blob in meta so the whole state lands or rolls back atomically.
+// Shape: { active: bool, until: number|null (ms epoch), hosts: string[] (empty = all) }
+function getMaintenance(db) {
+  const raw = getMeta(db, 'maintenance');
+  if (!raw) return { active: false, until: null, hosts: [] };
+  try {
+    const v = JSON.parse(raw);
+    return {
+      active: !!v.active,
+      until: v.until ? Number(v.until) : null,
+      hosts: Array.isArray(v.hosts) ? v.hosts.map(String) : [],
+    };
+  } catch {
+    return { active: false, until: null, hosts: [] };
+  }
+}
+
+function setMaintenance(db, state) {
+  setMeta(db, 'maintenance', JSON.stringify({
+    active: !!state.active,
+    until: state.until ? Number(state.until) : null,
+    hosts: Array.isArray(state.hosts) ? state.hosts.map(String) : [],
+  }));
+}
+
 // ---- access events ---------------------------------------------------------
 
 const MAX_ACCESS_ROWS = 200_000;     // hard cap to bound DB size
@@ -287,15 +314,54 @@ function ipDetail(db, ip, sinceMs) {
   return {
     summary,
     hosts: q('SELECT host, COUNT(*) AS c FROM access_events WHERE client_ip=? AND ts>=? GROUP BY host ORDER BY c DESC'),
-    paths: q(`SELECT uri, COUNT(*) AS c,
+    paths: q(`SELECT host, uri, COUNT(*) AS c,
                      SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) AS errors,
                      MAX(suspicious_path) AS probe
               FROM access_events WHERE client_ip=? AND ts>=?
-              GROUP BY uri ORDER BY c DESC LIMIT ?`, 30),
+              GROUP BY host, uri ORDER BY c DESC LIMIT ?`, 30),
     methods: q('SELECT method, COUNT(*) AS c FROM access_events WHERE client_ip=? AND ts>=? GROUP BY method ORDER BY c DESC'),
     statuses: q('SELECT status, COUNT(*) AS c FROM access_events WHERE client_ip=? AND ts>=? GROUP BY status ORDER BY c DESC'),
     user_agents: q('SELECT user_agent, COUNT(*) AS c FROM access_events WHERE client_ip=? AND ts>=? GROUP BY user_agent ORDER BY c DESC LIMIT 10'),
     recent: q('SELECT ts, host, method, uri, status, suspicious_path FROM access_events WHERE client_ip=? AND ts>=? ORDER BY id DESC LIMIT ?', 60),
+  };
+}
+
+// Everything one virtual host received within the window: summary + breakdowns.
+// `hosts` is the set of hostnames to aggregate together — a rule plus its
+// optional www. alias — so the access log covers both names as one site.
+function hostDetail(db, hosts, sinceMs) {
+  const since = Date.now() - sinceMs;
+  const list = Array.isArray(hosts) ? hosts : [hosts];
+  const ph = list.map(() => '?').join(',');
+  const summary = db.prepare(`
+    SELECT COUNT(*) AS total, MIN(ts) AS first_seen, MAX(ts) AS last_seen,
+           SUM(CASE WHEN status>=400 AND status<500 THEN 1 ELSE 0 END) AS c4xx,
+           SUM(CASE WHEN status>=500 THEN 1 ELSE 0 END) AS c5xx,
+           SUM(CASE WHEN status=404 THEN 1 ELSE 0 END) AS c404,
+           SUM(suspicious_path) AS probes,
+           COUNT(DISTINCT client_ip) AS ips
+    FROM access_events WHERE host IN (${ph}) AND ts>=?
+  `).get(...list, since);
+  const q = (sql, lim) => db.prepare(sql).all(...list, since, ...(lim ? [lim] : []));
+  return {
+    summary,
+    clients: q(`SELECT client_ip, COUNT(*) AS c,
+                       SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) AS errors,
+                       SUM(suspicious_path) AS probes, MAX(ts) AS last_seen
+                FROM access_events WHERE host IN (${ph}) AND ts>=?
+                GROUP BY client_ip ORDER BY c DESC LIMIT ?`, 30),
+    paths: q(`SELECT host, uri, COUNT(*) AS c,
+                     SUM(CASE WHEN status>=400 THEN 1 ELSE 0 END) AS errors,
+                     MAX(suspicious_path) AS probe
+              FROM access_events WHERE host IN (${ph}) AND ts>=?
+              GROUP BY host, uri ORDER BY c DESC LIMIT ?`, 30),
+    methods: q(`SELECT method, COUNT(*) AS c FROM access_events
+                WHERE host IN (${ph}) AND ts>=? GROUP BY method ORDER BY c DESC`),
+    statuses: q(`SELECT status, COUNT(*) AS c FROM access_events
+                 WHERE host IN (${ph}) AND ts>=? GROUP BY status ORDER BY c DESC`),
+    recent: q(`SELECT ts, client_ip, method, uri, status, suspicious_path
+               FROM access_events WHERE host IN (${ph}) AND ts>=?
+               ORDER BY id DESC LIMIT ?`, 60),
   };
 }
 
@@ -409,6 +475,8 @@ module.exports = {
   upsertByHostname,
   setMeta,
   getMeta,
+  getMaintenance,
+  setMaintenance,
   insertAccessEvents,
   pruneAccessEvents,
   recentEvents,
@@ -416,6 +484,7 @@ module.exports = {
   eventStats,
   hostsByIp,
   ipDetail,
+  hostDetail,
   getIpInfo,
   getIpInfoMany,
   upsertIpInfo,

@@ -245,18 +245,24 @@ fieldset label { color: var(--text); font-size: 13px; flex-direction: row; align
 }
 input[type=file] { font: inherit; font-size: 12px; color: var(--muted); }
 
-/* IP detail dialog */
-#ip-detail { width: min(760px, 96vw); }
+/* IP / host detail dialog — half the viewport, with a sane floor on small
+   screens and a 96vw cap so it never overflows on mobile. */
+#ip-detail, #host-detail { width: min(96vw, max(720px, 50vw)); }
+a.host-link {
+  color: inherit; text-decoration: none; border-bottom: 1px dotted var(--line);
+}
+a.host-link:hover { color: var(--accent); border-bottom-color: var(--accent); }
 .ip-detail-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 20px; border-bottom: 1px solid var(--line);
   position: sticky; top: 0; background: var(--panel);
 }
 .ip-detail-head h2 { margin: 0; font-size: 17px; font-family: ui-monospace, monospace; }
-#ip-detail-close {
+#ip-detail-close, #host-detail-close {
   background: transparent; border: 0; color: var(--muted); font-size: 16px; cursor: pointer;
 }
-#ip-detail-close:hover { color: var(--text); }
+#ip-detail-close:hover, #host-detail-close:hover { color: var(--text); }
+.head-right { display: flex; align-items: center; gap: 12px; }
 .ip-detail-body { padding: 14px 20px 18px; }
 .ip-detail-body section { margin-bottom: 16px; }
 .ip-detail-body h4 {
@@ -275,3 +281,79 @@ table.mini td {
 }
 table.mini tr:last-child td { border-bottom: 0; }
 .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+.path-host { color: var(--muted); }
+.ip-blocked { color: #f87171 !important; }
+
+/* Live access-log stream */
+.live-dot { font-size: 11px; font-weight: 600; color: #7be08a; white-space: nowrap; }
+.live-dot.off { color: var(--muted); }
+@keyframes rowflash {
+  from { background: rgba(123, 224, 138, 0.22); }
+  to   { background: transparent; }
+}
+table.mini tr.row-new td { animation: rowflash 1.6s ease-out; }
+
+/* Maintenance mode */
+.maint-banner {
+  display: flex; align-items: center; gap: 10px;
+  background: #2a1f3a; border: 1px solid #4a3a6a; color: #d7c8f5;
+  padding: 9px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px;
+}
+.maint-banner .grow { flex: 1; }
+.maint-banner button { background: #3a2f4a; border-color: #5a4a6a; color: #f0e8ff; }
+.maint-banner button:hover { background: #4a3f5a; }
+.maint-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, #c8a6ff, #8b5cf6);
+  box-shadow: 0 0 10px rgba(139, 92, 246, .6);
+  animation: maint-pulse 1.8s ease-in-out infinite;
+  flex-shrink: 0;
+}
+@keyframes maint-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: .55; transform: scale(.8); }
+}
+.maint-status {
+  background: #2a1f3a; border: 1px solid #4a3a6a; color: #d7c8f5;
+  padding: 8px 12px; border-radius: 6px; font-size: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+.maint-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+.maint-presets button {
+  font-size: 12px; padding: 5px 12px; border-radius: 14px;
+}
+.maint-presets button.selected {
+  background: var(--accent); border-color: var(--accent-d); color: #fff;
+}
+.maint-until-row { margin-top: 6px; }
+.maint-until-row input[type=datetime-local] {
+  background: #0f1218; color: var(--text); border: 1px solid var(--line);
+  padding: 5px 8px; border-radius: 5px; font: inherit; font-size: 13px;
+  color-scheme: dark;
+}
+#maint-until-hint { margin-left: 4px; }
+.maint-hosts {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px;
+  max-height: 220px; overflow-y: auto;
+  margin-top: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: #0f1218;
+}
+.maint-hosts label {
+  flex-direction: row; align-items: center; gap: 6px;
+  color: var(--text); font-size: 12px; padding: 2px 4px;
+}
+.maint-hosts label:hover { background: #1c2029; border-radius: 4px; }
+@media (max-width: 520px) { .maint-hosts { grid-template-columns: 1fr; } }
+
+/* Activity multi-select */
+th.check-col, td.check-col {
+  width: 30px; text-align: center; padding-left: 10px; padding-right: 2px;
+}
+.check-col input { cursor: pointer; margin: 0; }
+.bulk-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin: 8px 0; padding: 8px 12px;
+  background: #1f2530; border: 1px solid var(--accent-d); border-radius: 8px;
+}
+#activity-bulk-count { font-size: 13px; font-weight: 600; color: var(--text); }
+.bulk-actions { display: flex; gap: 8px; }

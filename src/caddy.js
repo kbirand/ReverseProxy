@@ -237,6 +237,126 @@ function automationPoliciesForRules(rules, opts = {}) {
   return policies;
 }
 
+// Minimal, Apple-styled "we'll be right back" page served by Caddy via a
+// static_response handler during maintenance. The end time is baked into the
+// JS as a literal; if `until` is null the timer is hidden and only the title
+// shows. Self-contained: no external assets, no fonts to fetch.
+function maintenancePageHtml(until) {
+  const untilLiteral = until ? Number(until) : 0;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>We'll be right back</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;
+  background:#fbfbfd;color:#1d1d1f;
+  display:flex;align-items:center;justify-content:center;
+  text-align:center;padding:32px 24px;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+}
+.wrap{max-width:560px;width:100%}
+.dot{
+  width:56px;height:56px;border-radius:50%;
+  background:radial-gradient(circle at 30% 30%,#5ac8fa,#0a84ff 55%,#5e5ce6);
+  margin:0 auto 32px;
+  box-shadow:0 8px 30px rgba(10,132,255,.25);
+  animation:pulse 2.8s ease-in-out infinite;
+}
+@keyframes pulse{
+  0%,100%{transform:scale(1);opacity:1}
+  50%{transform:scale(.94);opacity:.85}
+}
+h1{
+  font-size:48px;font-weight:600;letter-spacing:-0.025em;
+  margin:0 0 14px;line-height:1.05;
+}
+p.sub{font-size:19px;color:#86868b;margin:0 0 40px;line-height:1.4;font-weight:400}
+.timer{display:flex;justify-content:center;gap:10px}
+.cell{
+  background:rgba(0,0,0,.04);border-radius:16px;
+  padding:16px 12px;min-width:84px;
+  backdrop-filter:blur(20px);
+}
+.num{
+  font-size:36px;font-weight:500;font-variant-numeric:tabular-nums;
+  letter-spacing:-0.02em;line-height:1;
+}
+.lbl{
+  font-size:11px;color:#86868b;text-transform:uppercase;letter-spacing:0.1em;
+  margin-top:8px;font-weight:500;
+}
+.note{margin-top:36px;font-size:13px;color:#86868b}
+@media (prefers-color-scheme:dark){
+  body{background:#000;color:#f5f5f7}
+  .cell{background:rgba(255,255,255,.07)}
+  .lbl,.note,p.sub{color:#a1a1a6}
+}
+@media (max-width:480px){
+  h1{font-size:34px}
+  p.sub{font-size:16px;margin-bottom:32px}
+  .cell{min-width:64px;padding:13px 8px}
+  .num{font-size:28px}
+}
+</style>
+</head>
+<body>
+<main class="wrap" id="root">
+  <div class="dot" aria-hidden="true"></div>
+  <h1>We'll be right back.</h1>
+  <p class="sub">We're making a few improvements. Thanks for your patience.</p>
+  <div class="timer" id="timer" role="timer" aria-live="polite">
+    <div class="cell"><div class="num" id="td">0</div><div class="lbl">Days</div></div>
+    <div class="cell"><div class="num" id="th">00</div><div class="lbl">Hours</div></div>
+    <div class="cell"><div class="num" id="tm">00</div><div class="lbl">Minutes</div></div>
+    <div class="cell"><div class="num" id="ts">00</div><div class="lbl">Seconds</div></div>
+  </div>
+  <div class="note" id="note"></div>
+</main>
+<script>
+(function(){
+  var until=${untilLiteral};
+  var timer=document.getElementById('timer');
+  var note=document.getElementById('note');
+  if(!until){
+    timer.style.display='none';
+    return;
+  }
+  function pad(n){return n<10?'0'+n:String(n)}
+  var els={d:document.getElementById('td'),h:document.getElementById('th'),m:document.getElementById('tm'),s:document.getElementById('ts')};
+  var done=false;
+  function tick(){
+    var left=until-Date.now();
+    if(left<=0){
+      els.d.textContent='0';els.h.textContent='00';els.m.textContent='00';els.s.textContent='00';
+      if(!done){
+        done=true;
+        note.textContent='Reconnecting…';
+        setTimeout(function(){location.reload()},4000);
+      }
+      return;
+    }
+    var s=Math.floor(left/1000);
+    var d=Math.floor(s/86400);s-=d*86400;
+    var h=Math.floor(s/3600);s-=h*3600;
+    var m=Math.floor(s/60);s-=m*60;
+    els.d.textContent=String(d);
+    els.h.textContent=pad(h);
+    els.m.textContent=pad(m);
+    els.s.textContent=pad(s);
+  }
+  tick();setInterval(tick,1000);
+})();
+</script>
+</body>
+</html>`;
+}
+
 function renderConfig(rules, opts = {}) {
   const fallbackUpstream = opts.fallbackUpstream !== undefined
     ? opts.fallbackUpstream : DEFAULT_FALLBACK_UPSTREAM;
@@ -245,6 +365,7 @@ function renderConfig(rules, opts = {}) {
   const dnsProvider = opts.dnsProvider !== undefined ? opts.dnsProvider : DEFAULT_DNS_PROVIDER;
   const acmeEmail = opts.acmeEmail !== undefined ? opts.acmeEmail : DEFAULT_ACME_EMAIL;
   const globalBlocks = parseIpList((opts.globalBlocks || []).join('\n'));
+  const maintenance = opts.maintenance && opts.maintenance.active ? opts.maintenance : null;
   const enabled = rules.filter((r) => r.enabled);
 
   const httpRoutes = [];
@@ -267,6 +388,40 @@ function renderConfig(rules, opts = {}) {
     };
     httpRoutes.push(blockRoute);
     httpsRoutes.push(blockRoute);
+  }
+
+  // Maintenance mode: short-circuit a chosen set of hostnames (or every enabled
+  // rule when no specific hosts are picked) to a static "we'll be right back"
+  // page. Placed after the global blocklist so abusive IPs stay rejected, but
+  // before any per-rule routes so the backends never see the request.
+  if (maintenance) {
+    const targetHosts = (maintenance.hosts && maintenance.hosts.length)
+      ? maintenance.hosts.slice()
+      : enabled.flatMap(hostsFor);
+    if (targetHosts.length) {
+      const retryAfter = maintenance.until
+        ? Math.max(30, Math.floor((maintenance.until - Date.now()) / 1000))
+        : 3600;
+      const body = maintenancePageHtml(maintenance.until);
+      const mRoute = {
+        match: [{ host: Array.from(new Set(targetHosts)) }],
+        handle: [
+          {
+            handler: 'static_response',
+            status_code: 503,
+            headers: {
+              'Content-Type': ['text/html; charset=utf-8'],
+              'Cache-Control': ['no-store, max-age=0'],
+              'Retry-After': [String(retryAfter)],
+            },
+            body,
+          },
+        ],
+        terminal: true,
+      };
+      httpRoutes.push(mRoute);
+      httpsRoutes.push(mRoute);
+    }
   }
 
   // Match the Synology DSM behavior: serve both :80 and :443 for every rule
@@ -443,6 +598,7 @@ module.exports = {
   renderConfig,
   pushConfig,
   caddyHealthy,
+  maintenancePageHtml,
   DEFAULT_FALLBACK_UPSTREAM,
   DEFAULT_CERT_DIR,
   DEFAULT_ACCESS_LOG,

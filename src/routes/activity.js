@@ -2,6 +2,7 @@ const express = require('express');
 const db = require('../db');
 const { scoreActivity } = require('../activity');
 const { reloadCaddy } = require('../sync');
+const { accessEvents } = require('../access-log');
 const ipinfo = require('../ipinfo');
 
 function buildRouter(database) {
@@ -87,6 +88,75 @@ function buildRouter(database) {
     res.json({ ip, window_hours: hours, info, blocked, flags, suspicious, ...detail });
   });
 
+  // Access log for one virtual host: who hit it, top paths, recent requests.
+  // Folds in the www. alias when a matching rule serves it.
+  r.get('/host/:host', (req, res) => {
+    const host = req.params.host;
+    const hours = Math.min(Math.max(Number(req.query.hours) || 24, 1), 24 * 30);
+    const hosts = new Set([host]);
+    for (const rule of db.listRules(database)) {
+      if (rule.hostname === host || `www.${rule.hostname}` === host) {
+        hosts.add(rule.hostname);
+        if (rule.add_www) hosts.add(`www.${rule.hostname}`);
+      }
+    }
+    const detail = db.hostDetail(database, [...hosts], hours * 3600 * 1000);
+    const ips = detail.clients.map((c) => c.client_ip);
+    const infoMap = db.getIpInfoMany(database, ips);
+    const blocked = new Set(db.listGlobalBlocks(database).map((b) => b.ip));
+    detail.clients = detail.clients.map((c) => ({
+      ...c, info: infoMap[c.client_ip] || null, blocked: blocked.has(c.client_ip),
+    }));
+    detail.recent = detail.recent.map((e) => ({ ...e, blocked: blocked.has(e.client_ip) }));
+    res.json({ host, hosts: [...hosts], window_hours: hours, ...detail });
+    // Background-fill geo for client IPs we haven't enriched yet.
+    ipinfo.enrichMissing(database, ips, 6);
+  });
+
+  // Live access-event stream (Server-Sent Events). With ?host= it is filtered
+  // to that host and its www. alias; without, it streams every host. The
+  // host-detail dialog uses it to append requests the moment they arrive.
+  r.get('/stream', (req, res) => {
+    const host = req.query.host ? String(req.query.host) : null;
+    const wanted = new Set();
+    if (host) {
+      wanted.add(host);
+      for (const rule of db.listRules(database)) {
+        if (rule.hostname === host || `www.${rule.hostname}` === host) {
+          wanted.add(rule.hostname);
+          if (rule.add_www) wanted.add(`www.${rule.hostname}`);
+        }
+      }
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write('retry: 3000\n\n');
+
+    const onEvents = (events) => {
+      const matched = host ? events.filter((e) => wanted.has(e.host)) : events;
+      if (!matched.length) return;
+      const blocked = new Set(db.listGlobalBlocks(database).map((b) => b.ip));
+      for (const e of matched) {
+        const payload = { ...e, blocked: blocked.has(e.client_ip) };
+        res.write(`event: access\ndata: ${JSON.stringify(payload)}\n\n`);
+      }
+    };
+    accessEvents.on('events', onEvents);
+
+    // Comment-only pings keep the connection alive through idle proxy timeouts.
+    const ping = setInterval(() => res.write(': ping\n\n'), 25000);
+    if (ping.unref) ping.unref();
+
+    req.on('close', () => {
+      clearInterval(ping);
+      accessEvents.removeListener('events', onEvents);
+    });
+  });
+
   // Recent raw requests (?limit=, default 200).
   r.get('/recent', (req, res) => {
     res.json({ events: db.recentEvents(database, Number(req.query.limit) || 200) });
@@ -109,6 +179,27 @@ function buildRouter(database) {
       return res.status(502).json({ error: 'caddy_rejected', message: e.message, body: e.body });
     }
     res.status(201).json({ ok: true, ip });
+  });
+
+  // Block several IPs at once — one Caddy reload for the whole batch.
+  r.post('/blocklist/bulk', async (req, res) => {
+    const raw = Array.isArray(req.body && req.body.ips) ? req.body.ips : [];
+    const ips = [...new Set(raw.map((s) => String(s || '').trim()).filter(Boolean))];
+    if (!ips.length) {
+      return res.status(400).json({ error: 'bad_input', message: 'ips is required' });
+    }
+    const note = req.body && req.body.note ? String(req.body.note) : 'bulk block';
+    const already = new Set(db.listGlobalBlocks(database).map((b) => b.ip));
+    const added = ips.filter((ip) => !already.has(ip));
+    for (const ip of ips) db.addGlobalBlock(database, ip, note);
+    try {
+      await reloadCaddy(database);
+    } catch (e) {
+      // Roll back only the entries this request added — leave prior blocks be.
+      for (const ip of added) db.removeGlobalBlock(database, ip);
+      return res.status(502).json({ error: 'caddy_rejected', message: e.message, body: e.body });
+    }
+    res.status(201).json({ ok: true, count: ips.length, added: added.length });
   });
 
   r.delete('/blocklist/:ip', async (req, res) => {
