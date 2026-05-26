@@ -173,14 +173,24 @@ sed "s|__REPO_DIR__|$REPO_DIR|g" "$REPO_DIR/etc/rproxy-update.service" \
   > /etc/systemd/system/rproxy-update.service
 install -m 0644 "$REPO_DIR/etc/rproxy-update.path" /etc/systemd/system/rproxy-update.path
 
+# Caddy snapshot/restore helper: same pattern as self-update. Lets the UI
+# tar /var/lib/caddy and unpack a saved tarball back into it without ever
+# granting the UI process direct access to caddy's data dir.
+chmod +x "$REPO_DIR/scripts/caddy-helper.sh"
+sed "s|__REPO_DIR__|$REPO_DIR|g" "$REPO_DIR/etc/rproxy-caddy-helper.service" \
+  > /etc/systemd/system/rproxy-caddy-helper.service
+install -m 0644 "$REPO_DIR/etc/rproxy-caddy-helper.path" /etc/systemd/system/rproxy-caddy-helper.path
+install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" /var/lib/rproxy/staging
+
 # ---- 8. enable + (re)start services ----------------------------------------
 echo "[8/9] Enabling and starting services ..."
 systemctl daemon-reload
-systemctl enable caddy rproxy-ui rproxy-update.path >/dev/null 2>&1
+systemctl enable caddy rproxy-ui rproxy-update.path rproxy-caddy-helper.path >/dev/null 2>&1
 systemctl restart caddy
 sleep 2
 systemctl restart rproxy-ui
 systemctl restart rproxy-update.path
+systemctl restart rproxy-caddy-helper.path
 sleep 2
 
 # ---- 9. health check -------------------------------------------------------

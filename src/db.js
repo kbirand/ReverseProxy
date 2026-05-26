@@ -418,17 +418,41 @@ function removeGlobalBlock(db, ip) {
 
 // ---- backup / restore ------------------------------------------------------
 
+// Resolve where manual TLS certs live on disk for a given rule. Mirrors the
+// logic in caddy.js (tlsLoadDirectivesForRule) so export/import stay in sync.
+function manualCertDirFor(rule, certDir) {
+  if (!certDir) return null;
+  return rule.cert_path && String(rule.cert_path).trim()
+    ? String(rule.cert_path).trim()
+    : path.join(certDir, rule.hostname);
+}
+
 // A portable snapshot of everything the UI manages: rules, the global
-// blocklist, and the auth credentials. Transient monitoring tables
+// blocklist, the auth credentials, and (when certDir is provided) the
+// fullchain.pem + privkey.pem of every manual-TLS rule, embedded inline so
+// the backup is a single self-contained file. Transient monitoring tables
 // (access_events, ip_info) are intentionally excluded — they regenerate.
-function exportBackup(db) {
+function exportBackup(db, opts = {}) {
+  const rules = db.prepare('SELECT * FROM rules').all();
+  const certBundle = {};
+  if (opts.certDir) {
+    for (const rule of rules) {
+      if (rule.tls_mode !== 'manual') continue;
+      const dir = manualCertDirFor(rule, opts.certDir);
+      const entry = {};
+      try { entry.fullchain = fs.readFileSync(path.join(dir, 'fullchain.pem'), 'utf8'); } catch (_) {}
+      try { entry.privkey = fs.readFileSync(path.join(dir, 'privkey.pem'), 'utf8'); } catch (_) {}
+      if (entry.fullchain || entry.privkey) certBundle[rule.hostname] = entry;
+    }
+  }
   return {
     format: 'rproxy-backup',
-    version: 1,
+    version: 2,
     created_at: new Date().toISOString(),
-    rules: db.prepare('SELECT * FROM rules').all(),
+    rules,
     global_blocks: db.prepare('SELECT * FROM global_blocks').all(),
     meta: db.prepare("SELECT k, v FROM meta WHERE k LIKE 'auth_%'").all(),
+    certs: certBundle,
   };
 }
 
@@ -438,8 +462,10 @@ function tableColumns(db, table) {
 
 // Replace rules + global blocklist + auth meta from a backup, atomically.
 // Inserts only columns that exist in the current schema, so a backup made on a
-// slightly older/newer version still restores cleanly.
-function importBackup(db, data) {
+// slightly older/newer version still restores cleanly. When the backup carries
+// embedded certs (v2+) and certDir is provided, also writes fullchain.pem +
+// privkey.pem back to disk so manual-TLS rules work immediately after restore.
+function importBackup(db, data, opts = {}) {
   if (!data || data.format !== 'rproxy-backup' || !Array.isArray(data.rules)) {
     throw new Error('not a valid rproxy backup file');
   }
@@ -462,7 +488,37 @@ function importBackup(db, data) {
     }
   });
   tx();
-  return { rules: data.rules.length, blocks: (data.global_blocks || []).length };
+
+  const certResult = { written: 0, skipped: 0, failed: [] };
+  const certBundle = (data.certs && typeof data.certs === 'object') ? data.certs : {};
+  if (opts.certDir) {
+    const ruleByHost = new Map(data.rules.map((r) => [r.hostname, r]));
+    for (const [hostname, entry] of Object.entries(certBundle)) {
+      if (!entry || (!entry.fullchain && !entry.privkey)) { certResult.skipped++; continue; }
+      const rule = ruleByHost.get(hostname);
+      const dir = manualCertDirFor(rule || { hostname }, opts.certDir);
+      try {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
+        if (entry.fullchain) {
+          fs.writeFileSync(path.join(dir, 'fullchain.pem'), entry.fullchain, { mode: 0o644 });
+        }
+        if (entry.privkey) {
+          fs.writeFileSync(path.join(dir, 'privkey.pem'), entry.privkey, { mode: 0o600 });
+        }
+        certResult.written++;
+      } catch (e) {
+        certResult.failed.push({ hostname, error: e.message });
+      }
+    }
+  } else {
+    certResult.skipped = Object.keys(certBundle).length;
+  }
+
+  return {
+    rules: data.rules.length,
+    blocks: (data.global_blocks || []).length,
+    certs: certResult,
+  };
 }
 
 module.exports = {

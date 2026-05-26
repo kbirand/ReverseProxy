@@ -1,0 +1,13 @@
+[Unit]
+Description=rproxy Caddy snapshot / restore helper (root)
+# Reads /var/lib/rproxy/.caddy-action and either tars Caddy's storage into
+# /var/lib/rproxy/staging/caddy-snapshot.tar.gz or unpacks
+# /var/lib/rproxy/staging/caddy-restore.tar.gz back into /var/lib/caddy.
+# Triggered by rproxy-caddy-helper.path.
+
+[Service]
+Type=oneshot
+ExecStart=__REPO_DIR__/scripts/caddy-helper.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120

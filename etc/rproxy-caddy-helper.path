@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for an rproxy Caddy snapshot / restore request
+
+[Path]
+# The UI writes this file (with ReadWritePaths=/var/lib/rproxy) to ask the
+# privileged helper to either tar up Caddy's storage or unpack a tarball
+# back into it. The file's content is JSON: {"action":"snapshot"|"restore"}.
+PathExists=/var/lib/rproxy/.caddy-action
+Unit=rproxy-caddy-helper.service
+
+[Install]
+WantedBy=multi-user.target

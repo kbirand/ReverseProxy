@@ -1540,6 +1540,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#btn-backup').addEventListener('click', openBackupDialog);
   $('#backup-close').addEventListener('click', () => $('#backup-dialog').close());
   $('#restore-btn').addEventListener('click', onRestore);
+  $('#caddy-restore-btn').addEventListener('click', onCaddyRestore);
   $('#password-cancel').addEventListener('click', () => $('#password-dialog').close());
   $('#password-form').addEventListener('submit', onChangePassword);
   $('#pw-warning-change').addEventListener('click', openPasswordDialog);
@@ -1631,7 +1632,41 @@ function openPasswordDialog() {
 function openBackupDialog() {
   $('#backup-error').hidden = true;
   $('#restore-file').value = '';
+  const caddyFile = $('#caddy-restore-file');
+  if (caddyFile) caddyFile.value = '';
   $('#backup-dialog').showModal();
+}
+
+async function onCaddyRestore() {
+  const err = $('#backup-error');
+  err.hidden = true;
+  const file = $('#caddy-restore-file').files && $('#caddy-restore-file').files[0];
+  if (!file) { err.textContent = 'Choose a Caddy snapshot tarball first.'; err.hidden = false; return; }
+  if (!confirm('Restore Caddy storage from this snapshot?\n\n'
+    + 'This stops Caddy briefly, overwrites /var/lib/caddy, and restarts it. '
+    + 'Every site will be unreachable for a few seconds.')) return;
+  const btn = $('#caddy-restore-btn');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Restoring…';
+  try {
+    const r = await fetch('/api/system/caddy-restore', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/gzip' },
+      body: file,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.message || `HTTP ${r.status}`);
+    alert(`Caddy storage restored. ${data.message || ''}`);
+    $('#backup-dialog').close();
+  } catch (e) {
+    err.textContent = `Caddy restore failed: ${e.message}`;
+    err.hidden = false;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
 }
 
 async function onRestore() {
@@ -1658,7 +1693,14 @@ async function onRestore() {
     + 'You will be logged out and must sign in with the backup’s credentials.')) return;
   try {
     const r = await api('POST', '/system/restore', data);
-    alert(`Restored ${r.rules} rule(s) and ${r.blocks} blocklist entr${r.blocks === 1 ? 'y' : 'ies'}. Reloading…`);
+    const certs = r.certs || { written: 0, failed: [] };
+    let msg = `Restored ${r.rules} rule(s) and ${r.blocks} blocklist entr${r.blocks === 1 ? 'y' : 'ies'}`;
+    if (certs.written) msg += `, plus ${certs.written} TLS cert(s)`;
+    if (certs.failed && certs.failed.length) {
+      msg += `\n\n${certs.failed.length} cert(s) could not be written:\n`
+        + certs.failed.map((f) => `• ${f.hostname}: ${f.error}`).join('\n');
+    }
+    alert(`${msg}. Reloading…`);
     location.reload();
   } catch (e) {
     err.textContent = `Restore failed: ${e.message}`;

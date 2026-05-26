@@ -17,6 +17,10 @@ const database = db.open();
 auth.ensureAuthSeed(database);
 const app = express();
 
+// Restore uploads bundle every rule + embedded manual certs, so give that
+// one endpoint a larger ceiling. Mounted first so the per-route parser sets
+// req._body and the general parser below skips re-parsing.
+app.use('/api/system/restore', express.json({ limit: '20mb' }));
 app.use(express.json({ limit: '1mb' }));
 // Auth router is public (its routes self-guard); everything else under /api
 // requires a valid session. Static files stay public — they hold no secrets.

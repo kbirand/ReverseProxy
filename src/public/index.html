@@ -269,17 +269,36 @@
       <section class="backup-section">
         <h4>Download a backup</h4>
         <p class="hint">A single JSON file with every rule, the global blocklist,
-          and the login credentials.</p>
+          the login credentials, and the fullchain/privkey of each
+          manual-TLS rule — so a fresh install can be restored to a working
+          state in one step.</p>
         <a id="backup-download" class="primary btn-link" href="/api/system/backup">Download backup</a>
       </section>
 
       <section class="backup-section">
         <h4>Restore from a backup</h4>
         <p class="hint">⚠ Replaces <strong>all</strong> current rules, the global
-          blocklist, and the login. You will be logged out and must sign in with
+          blocklist, and the login, and overwrites any manual-TLS cert files
+          carried in the backup. You will be logged out and must sign in with
           the credentials from the backup.</p>
         <input type="file" id="restore-file" accept=".json,application/json">
         <button type="button" id="restore-btn" class="danger">Restore</button>
+      </section>
+
+      <section class="backup-section">
+        <h4>Caddy storage snapshot (optional)</h4>
+        <p class="hint">A tarball of <code>/var/lib/caddy</code> — every ACME-issued
+          certificate, the ACME account key, and the local CA root. Useful when
+          migrating to a new machine without forcing Let's Encrypt to re-issue
+          (and burning rate-limit budget) on first hit.</p>
+        <div class="snapshot-actions">
+          <a id="caddy-snapshot-download" class="primary btn-link" href="/api/system/caddy-snapshot">Download Caddy snapshot</a>
+        </div>
+        <p class="hint" style="margin-top: 0.75rem;">Restoring a snapshot stops Caddy briefly,
+          overwrites its data dir, then restarts it. Manual-TLS certs travel in
+          the JSON backup above instead.</p>
+        <input type="file" id="caddy-restore-file" accept=".tar.gz,.tgz,application/gzip">
+        <button type="button" id="caddy-restore-btn" class="danger">Restore Caddy storage</button>
       </section>
 
       <div class="dialog-actions">
