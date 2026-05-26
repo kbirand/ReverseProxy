@@ -15,8 +15,12 @@ echo "[update] repo=$REPO_DIR branch=$BRANCH owner=$OWNER"
 
 cd "$REPO_DIR"
 
-# git may refuse a root operation on a dir owned by someone else.
-git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
+# git may refuse a root operation on a dir owned by someone else. Use the
+# system gitconfig (/etc/gitconfig) rather than --global because systemd
+# spawns this service with HOME unset, and --global would silently write
+# to ./.gitconfig instead of /root/.gitconfig — leaving git unable to find
+# the safe.directory entry on the very next call.
+git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
 
 # Safety: never blow away uncommitted local edits to tracked files.
 if ! git diff --quiet || ! git diff --cached --quiet; then
