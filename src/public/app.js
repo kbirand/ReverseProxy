@@ -479,13 +479,14 @@ function countryLabel(ip) {
 
 function switchView(view) {
   state.view = view;
-  for (const v of ['rules', 'activity', 'blocklist']) {
+  for (const v of ['rules', 'activity', 'blocklist', 'firewall']) {
     $(`#view-${v}`).hidden = view !== v;
     $(`#nav-${v}`).classList.toggle('active', view === v);
   }
   for (const el of $$('.rules-only')) el.style.display = view === 'rules' ? '' : 'none';
   if (view === 'activity') loadActivity();
   if (view === 'blocklist') loadBlocklist();
+  if (view === 'firewall') loadFirewall();
 }
 
 async function loadActivity(opts = {}) {
@@ -726,6 +727,98 @@ function renderBlocklist(blocks) {
       <td class="muted">${escapeHtml(b.note || '')}</td>
       <td class="row-actions"><button data-act="unblock" data-ip="${escapeHtml(b.ip)}">Unblock</button></td>
     </tr>`).join('');
+}
+
+// ---- Firewall (ufw) ----------------------------------------------------
+
+async function loadFirewall() {
+  showError('');
+  $('#firewall-body').innerHTML = `<tr><td colspan="7" class="muted">Reading firewall…</td></tr>`;
+  try {
+    renderFirewall(await api('GET', '/system/firewall'));
+  } catch (e) {
+    $('#firewall-body').innerHTML = `<tr><td colspan="7" class="muted">—</td></tr>`;
+    showError(`Firewall load failed: ${e.message}`);
+  }
+}
+
+function renderFirewall(data) {
+  const active = !!data.active;
+  const stateEl = $('#fw-state');
+  stateEl.textContent = active ? '● active' : '○ inactive';
+  stateEl.classList.toggle('on', active);
+  stateEl.classList.toggle('off', !active);
+  $('#fw-toggle').textContent = active ? 'Disable firewall' : 'Enable firewall';
+
+  const rules = data.rules || [];
+  const tbody = $('#firewall-body');
+  if (!rules.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">${active ? 'No rules.' : 'Firewall is inactive — enable it to enforce rules.'}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rules.map((r) => `
+    <tr>
+      <td class="num">${r.num}</td>
+      <td>${escapeHtml(r.to)}</td>
+      <td><span class="fw-act fw-${r.action.toLowerCase()}">${escapeHtml(r.action)}</span></td>
+      <td class="muted">${escapeHtml(r.direction)}</td>
+      <td class="ip">${escapeHtml(r.from)}</td>
+      <td class="muted">${escapeHtml(r.comment || '')}</td>
+      <td class="row-actions"><button data-act="fw-del" data-num="${r.num}" data-desc="${escapeHtml(`${r.action} ${r.to} from ${r.from}`)}">Delete</button></td>
+    </tr>`).join('');
+}
+
+async function onFirewallAdd() {
+  showError('');
+  const body = {
+    action: $('#fw-action').value,
+    port: $('#fw-port').value.trim(),
+    proto: $('#fw-proto').value,
+    from: $('#fw-from').value.trim(),
+    comment: $('#fw-comment').value.trim(),
+  };
+  if (!body.port && !body.from) {
+    showError('Add a port, a source address, or both.');
+    return;
+  }
+  try {
+    renderFirewall(await api('POST', '/system/firewall/rule', body));
+    $('#fw-port').value = '';
+    $('#fw-from').value = '';
+    $('#fw-comment').value = '';
+  } catch (e) {
+    showError(`Add rule failed: ${e.message}`);
+  }
+}
+
+async function deleteFirewallRule(num, desc) {
+  if (!confirm(`Delete firewall rule ${num}?\n\n${desc}\n\nIf this is the rule that allows your own network, you may lose access to this UI.`)) return;
+  showError('');
+  try {
+    renderFirewall(await api('DELETE', `/system/firewall/rule/${num}`));
+  } catch (e) {
+    showError(`Delete failed: ${e.message}`);
+  }
+}
+
+async function toggleFirewall() {
+  const enabling = $('#fw-toggle').textContent.startsWith('Enable');
+  const msg = enabling
+    ? 'Enable the firewall now?\n\nIncoming traffic not matched by an allow rule will be blocked.'
+    : 'Disable the firewall?\n\nThis opens ALL ports on this machine to anyone who can reach it.';
+  if (!confirm(msg)) return;
+  showError('');
+  try {
+    renderFirewall(await api('POST', '/system/firewall/toggle', { enable: enabling }));
+  } catch (e) {
+    showError(`Toggle failed: ${e.message}`);
+  }
+}
+
+function onFirewallClick(ev) {
+  const btn = ev.target.closest('button[data-act="fw-del"]');
+  if (!btn) return;
+  deleteFirewallRule(Number(btn.dataset.num), btn.dataset.desc || '');
 }
 
 function renderRecent(events) {
@@ -1455,6 +1548,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#nav-rules').addEventListener('click', () => switchView('rules'));
   $('#nav-activity').addEventListener('click', () => switchView('activity'));
   $('#nav-blocklist').addEventListener('click', () => switchView('blocklist'));
+  $('#nav-firewall').addEventListener('click', () => switchView('firewall'));
   $('#activity-refresh').addEventListener('click', loadActivity);
   $('#activity-window').addEventListener('change', loadActivity);
   $('#activity-body').addEventListener('click', onActivityClick);
@@ -1481,6 +1575,11 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#gb-add').addEventListener('click', onGlobalBlockAdd);
   $('#gb-ip').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') onGlobalBlockAdd(); });
   $('#gb-note').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') onGlobalBlockAdd(); });
+  $('#fw-refresh').addEventListener('click', loadFirewall);
+  $('#fw-toggle').addEventListener('click', toggleFirewall);
+  $('#fw-add').addEventListener('click', onFirewallAdd);
+  $('#fw-comment').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') onFirewallAdd(); });
+  $('#firewall-body').addEventListener('click', onFirewallClick);
   $('#ip-detail-close').addEventListener('click', () => $('#ip-detail').close());
   $('#ip-detail').addEventListener('close', () => { state.ipDetail.ip = null; });
   $('#ip-detail-body').addEventListener('click', onIpDetailClick);

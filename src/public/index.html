@@ -28,6 +28,7 @@
       <button id="nav-rules" class="nav-btn active">Rules</button>
       <button id="nav-activity" class="nav-btn">Activity</button>
       <button id="nav-blocklist" class="nav-btn">Blocklist</button>
+      <button id="nav-firewall" class="nav-btn">Firewall</button>
     </nav>
     <div class="status" id="status">…</div>
     <input type="search" id="search" class="search rules-only" placeholder="Filter — try *.com or api* or 3001"
@@ -159,6 +160,41 @@
       <table id="blocklist-table">
         <thead><tr><th>IP / CIDR</th><th>Added</th><th>Note</th><th></th></tr></thead>
         <tbody id="blocklist-body"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div id="view-firewall" hidden>
+      <div class="activity-toolbar">
+        <span id="fw-state" class="fw-state">…</span>
+        <button id="fw-toggle">Toggle firewall</button>
+        <span class="grow"></span>
+        <button id="fw-refresh">Refresh</button>
+      </div>
+
+      <div class="fw-addbar">
+        <select id="fw-action" title="Allow or deny matching traffic">
+          <option value="allow">Allow</option>
+          <option value="deny">Deny</option>
+        </select>
+        <input type="text" id="fw-port" class="fw-in" placeholder="port (e.g. 8080)" inputmode="numeric" autocomplete="off">
+        <select id="fw-proto" title="Protocol">
+          <option value="">tcp + udp</option>
+          <option value="tcp">tcp</option>
+          <option value="udp">udp</option>
+        </select>
+        <input type="text" id="fw-from" class="fw-in" placeholder="from — IP/CIDR or blank for any" autocomplete="off">
+        <input type="text" id="fw-comment" class="fw-in" placeholder="comment (optional)" autocomplete="off">
+        <button id="fw-add" class="primary">Add rule</button>
+      </div>
+
+      <p class="hint">Rules are evaluated top-to-bottom against the host firewall (<code>ufw</code>).
+        A rule with only a <strong>source</strong> allows that address on every port; with only a
+        <strong>port</strong> it applies to all sources. <strong>Deleting the rule that lets your
+        own network in can lock you out</strong> — the UI warns first.</p>
+
+      <table id="firewall-table">
+        <thead><tr><th>#</th><th>To</th><th>Action</th><th>Dir</th><th>From</th><th>Comment</th><th></th></tr></thead>
+        <tbody id="firewall-body"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
       </table>
     </div>
   </main>

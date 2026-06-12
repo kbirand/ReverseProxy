@@ -34,6 +34,14 @@ Works in front of any set of HTTP backends.
 - All IP matching is **Cloudflare-aware**: it uses the real visitor IP, not the
   CDN edge.
 
+**Firewall** (the *Firewall* tab)
+- Manage the host **`ufw`** firewall from the UI — view rules, add allow/deny
+  rules (by port, protocol and/or source IP/CIDR), delete rules, and enable or
+  disable the firewall.
+- The UI stays unprivileged: it never runs `ufw` directly but hands each request
+  to a root systemd helper, and every field is strictly validated on both sides
+  (see [Firewall](#firewall)).
+
 **Operations**
 - **Login** for the admin UI (see [Authentication](#authentication)).
 - **Self-update** — checks GitHub and installs updates in one click
@@ -135,7 +143,7 @@ The admin UI and every `/api/*` endpoint require a login.
 
 ## Activity, monitoring & blocking
 
-The UI has three tabs: **Rules**, **Activity**, **Blocklist**.
+The UI has four tabs: **Rules**, **Activity**, **Blocklist**, **Firewall**.
 
 **Activity** — Caddy writes a JSON access log (`/var/log/rproxy/access.log`)
 which the UI tails into SQLite. The tab shows a per-IP rollup: request count,
@@ -155,6 +163,35 @@ ISP/ASN, datacenter/proxy flags, the hosts and paths it hit, and recent requests
 
 Suspicious-IP flags are heuristic and transparent: `probe-paths`,
 `path-scanning`, `high-error-rate`, `host-sweep`, `high-volume`.
+
+## Firewall
+
+The **Firewall** tab manages the host's [`ufw`](https://launchpad.net/ufw)
+firewall — the OS-level packet filter, *separate* from rproxy's per-rule and
+global IP blocking (which act inside Caddy on HTTP requests). Use it to control
+which ports are reachable at all, and from where.
+
+- **View** the firewall state (active / inactive) and the numbered rule list.
+- **Add** an allow or deny rule by port, protocol (`tcp`/`udp`/both) and/or
+  source IP/CIDR. A rule with only a source allows that address on every port;
+  with only a port it applies to every source.
+- **Delete** a rule by number, or **enable / disable** the firewall. Both are
+  confirmed first — deleting the rule that admits your own network can lock you
+  out, and disabling opens every port.
+
+> `ufw` lists IPv4 and IPv6 as separate numbered rules, so `allow 8080/tcp`
+> shows up as two lines (one tagged `(v6)`); delete both to remove it fully.
+
+**How it stays safe.** `ufw` needs root even to read its status, but the UI runs
+unprivileged as `rproxy`. So, like the Caddy and self-update helpers, the UI
+never executes `ufw` — it writes a small JSON request to
+`/var/lib/rproxy/.ufw-action`, which a root systemd path unit
+(`rproxy-ufw-helper.path` → `.service`) turns into a single, validated `ufw`
+run via [`scripts/ufw-helper.sh`](scripts/ufw-helper.sh). Every field (port,
+protocol, source, comment) is validated against a strict pattern **twice** — in
+the Node route and again in the root helper — and values are only ever placed
+as quoted argument tokens, never evaluated by the shell. If `ufw` isn't
+installed, the tab simply reports it's unavailable.
 
 ## Updating rproxy
 
@@ -200,8 +237,10 @@ sudo journalctl -u caddy     -f -o cat
 Both services are `systemd`-managed with `Restart=always` — they survive
 crashes and reboots. No PM2 / forever needed.
 
-The installer also sets up `rproxy-update.path` / `rproxy-update.service` —
-the systemd units behind the one-click self-update.
+The installer also sets up three pairs of privileged path/service units that let
+the unprivileged UI request root work without holding any privilege itself:
+`rproxy-update.*` (one-click self-update), `rproxy-caddy-helper.*` (Caddy
+storage snapshot / restore), and `rproxy-ufw-helper.*` (the Firewall tab).
 
 ## Development
 

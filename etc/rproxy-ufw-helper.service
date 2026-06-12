@@ -1,0 +1,12 @@
+[Unit]
+Description=rproxy ufw firewall helper (root)
+# Reads /var/lib/rproxy/.ufw-action (JSON), runs the requested ufw operation,
+# and publishes /var/lib/rproxy/.ufw-status + /var/lib/rproxy/.ufw-action-result
+# back to the unprivileged UI. Triggered by rproxy-ufw-helper.path.
+
+[Service]
+Type=oneshot
+ExecStart=__REPO_DIR__/scripts/ufw-helper.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=60

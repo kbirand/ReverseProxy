@@ -182,15 +182,24 @@ sed "s|__REPO_DIR__|$REPO_DIR|g" "$REPO_DIR/etc/rproxy-caddy-helper.service" \
 install -m 0644 "$REPO_DIR/etc/rproxy-caddy-helper.path" /etc/systemd/system/rproxy-caddy-helper.path
 install -d -m 0750 -o "$RUN_USER" -g "$RUN_USER" /var/lib/rproxy/staging
 
+# ufw firewall helper: same trigger-file pattern. Lets the UI's Firewall tab
+# run ufw (which needs root, even to read status) without granting the UI any
+# privilege. No-op if ufw isn't installed — the tab just reports it's missing.
+chmod +x "$REPO_DIR/scripts/ufw-helper.sh"
+sed "s|__REPO_DIR__|$REPO_DIR|g" "$REPO_DIR/etc/rproxy-ufw-helper.service" \
+  > /etc/systemd/system/rproxy-ufw-helper.service
+install -m 0644 "$REPO_DIR/etc/rproxy-ufw-helper.path" /etc/systemd/system/rproxy-ufw-helper.path
+
 # ---- 8. enable + (re)start services ----------------------------------------
 echo "[8/9] Enabling and starting services ..."
 systemctl daemon-reload
-systemctl enable caddy rproxy-ui rproxy-update.path rproxy-caddy-helper.path >/dev/null 2>&1
+systemctl enable caddy rproxy-ui rproxy-update.path rproxy-caddy-helper.path rproxy-ufw-helper.path >/dev/null 2>&1
 systemctl restart caddy
 sleep 2
 systemctl restart rproxy-ui
 systemctl restart rproxy-update.path
 systemctl restart rproxy-caddy-helper.path
+systemctl restart rproxy-ufw-helper.path
 sleep 2
 
 # ---- 9. health check -------------------------------------------------------

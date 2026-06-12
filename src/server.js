@@ -9,6 +9,7 @@ const rulesRoute = require('./routes/rules');
 const systemRoute = require('./routes/system');
 const activityRoute = require('./routes/activity');
 const authRoute = require('./routes/auth');
+const firewallRoute = require('./routes/firewall');
 
 const PORT = Number(process.env.PORT || 8080);
 const BIND = process.env.BIND || '0.0.0.0';
@@ -27,6 +28,8 @@ app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', authRoute.buildRouter(database));
 app.use('/api', auth.requireAuth(database));
 app.use('/api/rules', rulesRoute.buildRouter(database));
+// Mounted before /api/system so this more specific path wins cleanly.
+app.use('/api/system/firewall', firewallRoute.buildRouter());
 app.use('/api/system', systemRoute.buildRouter(database));
 app.use('/api/activity', activityRoute.buildRouter(database));
 app.use(express.static(path.join(__dirname, 'public')));

@@ -293,6 +293,17 @@ table.mini tr:last-child td { border-bottom: 0; }
 }
 table.mini tr.row-new td { animation: rowflash 1.6s ease-out; }
 
+/* Firewall (ufw) panel */
+.fw-state { font-size: 12px; font-weight: 700; white-space: nowrap; }
+.fw-state.on { color: #7be08a; }
+.fw-state.off { color: var(--muted); }
+.fw-addbar { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; flex-wrap: wrap; }
+.fw-addbar .fw-in { width: 200px; }
+.fw-act { font-weight: 700; font-size: 11px; letter-spacing: 0.02em; }
+.fw-act.fw-allow { color: #7be08a; }
+.fw-act.fw-deny, .fw-act.fw-reject { color: #f87171; }
+.fw-act.fw-limit { color: #fbbf77; }
+
 /* Maintenance mode */
 .maint-banner {
   display: flex; align-items: center; gap: 10px;
