@@ -20,13 +20,19 @@ const app = express();
 
 // Restore uploads bundle every rule + embedded manual certs, so give that
 // one endpoint a larger ceiling. Mounted first so the per-route parser sets
-// req._body and the general parser below skips re-parsing.
-app.use('/api/system/restore', express.json({ limit: '20mb' }));
+// req._body and the general parser below skips re-parsing. Guarded by
+// requireAuth so an unauthenticated request is rejected BEFORE its (up to
+// 20mb) body is parsed — the general /api gate still re-checks downstream.
+app.use('/api/system/restore', auth.requireAuth(database), express.json({ limit: '20mb' }));
 app.use(express.json({ limit: '1mb' }));
 // Auth router is public (its routes self-guard); everything else under /api
 // requires a valid session. Static files stay public — they hold no secrets.
 app.use('/api/auth', authRoute.buildRouter(database));
 app.use('/api', auth.requireAuth(database));
+// Until the default admin/admin password is changed, block privileged and
+// secret-exposing endpoints (rule/firewall edits, self-update, restore, backup,
+// snapshots). Login + password change live on the public /api/auth router above.
+app.use('/api', auth.requireNonDefaultPassword(database));
 app.use('/api/rules', rulesRoute.buildRouter(database));
 // Mounted before /api/system so this more specific path wins cleanly.
 app.use('/api/system/firewall', firewallRoute.buildRouter());
@@ -60,8 +66,26 @@ async function syncOnStartup() {
   scheduleMaintenanceAutoEnd(database);
 }
 
+// Loudly flag the most dangerous misconfiguration: the known default credential
+// still active on a network-reachable bind. Privileged endpoints are already
+// blocked in this state (requireNonDefaultPassword), but make it impossible to
+// miss in the logs.
+function warnIfInsecure() {
+  if (!auth.AUTH_ENABLED) {
+    console.warn('[rproxy-ui] WARNING: AUTH_ENABLED=false — the UI is completely unauthenticated. Use only on a trusted, isolated network.');
+    return;
+  }
+  const loopback = BIND === '127.0.0.1' || BIND === '::1' || BIND === 'localhost';
+  if (auth.passwordIsDefault(database)) {
+    console.warn('[rproxy-ui] WARNING: the admin password is still the default (admin/admin). '
+      + 'Privileged actions are DISABLED until you change it (topbar → Password).'
+      + (loopback ? '' : ` The UI is bound to ${BIND} (network-reachable) — change the password now.`));
+  }
+}
+
 app.listen(PORT, BIND, () => {
   console.log(`[rproxy-ui] listening on ${BIND}:${PORT}`);
+  warnIfInsecure();
   syncOnStartup();
   // Tail Caddy's access log into SQLite for the activity view.
   startIngester(database);

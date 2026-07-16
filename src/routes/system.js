@@ -11,6 +11,10 @@ const { reloadCaddy, scheduleMaintenanceAutoEnd } = require('../sync');
 // Writing this file is picked up by rproxy-update.path, which starts the
 // privileged rproxy-update.service. Keeps the UI sandbox intact (no sudo).
 const UPDATE_TRIGGER = process.env.UPDATE_TRIGGER || '/var/lib/rproxy/.update-requested';
+// The one-click self-update runs privileged (root git reset --hard + restart).
+// Operators who don't want that button live can disable it with UPDATE_ENABLED=false;
+// updates are then only possible via a manual `git pull && ./install.sh`.
+const UPDATE_ENABLED = process.env.UPDATE_ENABLED !== 'false';
 
 // Privileged Caddy snapshot/restore helper. The UI writes CADDY_ACTION_FILE
 // to request work; the helper writes CADDY_RESULT_FILE when done and stages
@@ -199,6 +203,13 @@ function buildRouter(database) {
   // Trigger a self-update by dropping the request file. systemd's
   // rproxy-update.path notices it and starts the privileged updater.
   r.post('/update', (req, res) => {
+    if (!UPDATE_ENABLED) {
+      return res.status(403).json({
+        error: 'update_disabled',
+        message: 'One-click self-update is disabled (UPDATE_ENABLED=false). '
+          + 'Update manually with git pull + ./install.sh.',
+      });
+    }
     try {
       fs.writeFileSync(UPDATE_TRIGGER, `requested ${new Date().toISOString()}\n`);
       res.json({ ok: true, message: 'Update requested. The UI will restart in a few seconds.' });

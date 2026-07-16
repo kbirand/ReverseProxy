@@ -104,6 +104,17 @@ case "$ACTION" in
       rm -f "$RESTORE_TGZ"
       exit 1
     fi
+    # Reject symlink/hardlink members outright. Every member path already passed
+    # the in-tree check above, but an in-tree symlink (e.g. .local/share/caddy/x
+    # -> /etc) could redirect a *later* member's write outside the storage tree
+    # while its own path still looks safe. The verbose listing's first column is
+    # the type flag: 'l' = symlink, 'h' = hardlink.
+    LINKS="$(tar -tvzf "$RESTORE_TGZ" | grep -E '^[lh]' || true)"
+    if [[ -n "$LINKS" ]]; then
+      write_result error "rejecting tarball — contains link entries (symlink/hardlink not allowed)"
+      rm -f "$RESTORE_TGZ"
+      exit 1
+    fi
     # Stop caddy while we swap the storage to avoid races with renewals.
     systemctl stop caddy || true
     install -d -m 0700 -o caddy -g caddy "$CADDY_HOME/.local" "$CADDY_HOME/.local/share"

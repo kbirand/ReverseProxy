@@ -1,5 +1,6 @@
 const path = require('node:path');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const Database = require('better-sqlite3');
 
 const DEFAULT_DB = path.join(__dirname, '..', 'data', 'rules.db');
@@ -110,6 +111,40 @@ function normalize(input) {
   return r;
 }
 
+// A hostname is used as a Caddy host matcher AND as a path segment when
+// resolving a manual-TLS rule's cert directory (path.join(certDir, hostname)).
+// Restrict it to real DNS names (optionally a `*.` wildcard prefix) so it can
+// never carry `/`, `\`, or `..` into a filesystem path. Single labels (e.g.
+// `localhost`) are allowed; empty labels (which would permit `..`) are not.
+const HOSTNAME_RE =
+  /^(\*\.)?([A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)(\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*$/;
+
+function isValidHostname(h) {
+  return typeof h === 'string' && h.length > 0 && h.length <= 253 && HOSTNAME_RE.test(h);
+}
+
+// A manual cert_path is an admin-supplied directory ("your files" mode). Allow
+// an absolute path anywhere the process can read, but reject relative paths and
+// any `..` traversal segment so it can't be used to walk out of an expected
+// tree via crafted relative components.
+function isSafeCertPath(p) {
+  if (p === undefined || p === null || p === '') return true; // optional
+  const s = String(p);
+  if (!path.isAbsolute(s)) return false;
+  return !s.split(/[\\/]/).includes('..');
+}
+
+// Validate the security-sensitive fields of a rule before it is written.
+// Throws on invalid input so create/update/import all fail closed.
+function assertSafeRule(r) {
+  if (r.hostname !== undefined && !isValidHostname(r.hostname)) {
+    throw new Error(`invalid hostname: ${JSON.stringify(r.hostname)} (must be a valid DNS name)`);
+  }
+  if (!isSafeCertPath(r.cert_path)) {
+    throw new Error('invalid cert_path (must be an absolute path with no ".." segments)');
+  }
+}
+
 function listRules(db) {
   return db.prepare('SELECT * FROM rules ORDER BY hostname COLLATE NOCASE').all();
 }
@@ -123,6 +158,7 @@ function createRule(db, input) {
   if (!r.hostname || !r.backend_host || !r.backend_port) {
     throw new Error('hostname, backend_host, backend_port are required');
   }
+  assertSafeRule(r);
   if (!r.tls_mode) r.tls_mode = 'http';
   if (r.read_timeout === undefined) r.read_timeout = 60;
   if (r.enabled === undefined) r.enabled = 1;
@@ -164,6 +200,7 @@ function updateRule(db, id, patch) {
   if (!existing) return null;
   const r = normalize(patch);
   const merged = { ...existing, ...r, updated_at: Date.now() };
+  assertSafeRule(merged);
   db.prepare(`
     UPDATE rules SET
       hostname=@hostname, backend_host=@backend_host, backend_port=@backend_port,
@@ -451,7 +488,10 @@ function exportBackup(db, opts = {}) {
     created_at: new Date().toISOString(),
     rules,
     global_blocks: db.prepare('SELECT * FROM global_blocks').all(),
-    meta: db.prepare("SELECT k, v FROM meta WHERE k LIKE 'auth_%'").all(),
+    // Carry the username + password hash for migration, but NEVER the session
+    // signing secret (auth_secret): it lets anyone with the backup forge admin
+    // sessions indefinitely. The secret is regenerated on the target host.
+    meta: db.prepare("SELECT k, v FROM meta WHERE k LIKE 'auth_%' AND k <> 'auth_secret'").all(),
     certs: certBundle,
   };
 }
@@ -469,6 +509,9 @@ function importBackup(db, data, opts = {}) {
   if (!data || data.format !== 'rproxy-backup' || !Array.isArray(data.rules)) {
     throw new Error('not a valid rproxy backup file');
   }
+  // Validate every rule's security-sensitive fields BEFORE the destructive wipe
+  // below, so a hostile backup is rejected without touching existing config.
+  for (const r of data.rules) assertSafeRule(r);
   const ruleCols = tableColumns(db, 'rules');
   const blockCols = tableColumns(db, 'global_blocks');
   const insertRow = (table, cols, row) => {
@@ -484,8 +527,15 @@ function importBackup(db, data, opts = {}) {
     for (const r of data.rules) insertRow('rules', ruleCols, r);
     for (const b of (data.global_blocks || [])) insertRow('global_blocks', blockCols, b);
     for (const m of (data.meta || [])) {
-      if (m && typeof m.k === 'string' && m.k.startsWith('auth_')) setMeta(db, m.k, m.v);
+      // Never import a signing secret from an uploaded file — it would let the
+      // uploader forge sessions. Restore username/password hash/flags only.
+      if (m && typeof m.k === 'string' && m.k.startsWith('auth_') && m.k !== 'auth_secret') {
+        setMeta(db, m.k, m.v);
+      }
     }
+    // Rotate the signing secret on every restore: invalidates all outstanding
+    // cookies and guarantees the secret is independent of the backup contents.
+    setMeta(db, 'auth_secret', crypto.randomBytes(32).toString('hex'));
   });
   tx();
 

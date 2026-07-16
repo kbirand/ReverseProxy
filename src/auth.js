@@ -51,6 +51,15 @@ function ensureAuthSeed(database) {
   }
 }
 
+// Rotate the session-signing secret. Every outstanding session cookie is signed
+// with the old secret, so rotating invalidates them all — call this on password
+// change/reset (and after a restore) so a leaked cookie or secret cannot outlive
+// the credential it belonged to. The caller re-issues the current admin's cookie
+// afterwards to avoid logging themselves out.
+function rotateAuthSecret(database) {
+  db.setMeta(database, 'auth_secret', crypto.randomBytes(32).toString('hex'));
+}
+
 function passwordIsDefault(database) {
   return db.getMeta(database, 'auth_pw_is_default') === '1';
 }
@@ -119,6 +128,35 @@ function readSession(req, database) {
   }
 }
 
+// While the admin password is still the shipped default (admin/admin), refuse
+// every state-changing and secret-exposing request. The operator can still log
+// in and change the password (that flow lives on the public /api/auth router,
+// ahead of this gate), and read-only GETs still work so the UI can render the
+// change-password screen — but rule edits, firewall/ufw changes, self-update,
+// restore, backup download and Caddy snapshots are all blocked until the
+// default credential is replaced. This shrinks the exploit value of the known
+// default to nearly nothing: it cannot reach the privileged helpers or exfil
+// secrets, and it forces the operator to change the password first.
+const SENSITIVE_DEFAULT_GETS = ['/api/system/backup', '/api/system/caddy-snapshot'];
+
+function requireNonDefaultPassword(database) {
+  return (req, res, next) => {
+    if (!AUTH_ENABLED) return next();
+    if (!passwordIsDefault(database)) return next();
+    const pathOnly = (req.originalUrl || req.url).split('?')[0];
+    const isMutating = req.method !== 'GET' && req.method !== 'HEAD';
+    const isSensitiveGet = SENSITIVE_DEFAULT_GETS.includes(pathOnly);
+    if (isMutating || isSensitiveGet) {
+      return res.status(403).json({
+        error: 'default_password',
+        message: 'Change the default admin password before using this feature '
+          + '(topbar → Password). Privileged actions are disabled until then.',
+      });
+    }
+    return next();
+  };
+}
+
 // Express middleware factory. Pass-through when auth is disabled.
 function requireAuth(database) {
   return (req, res, next) => {
@@ -132,7 +170,25 @@ function requireAuth(database) {
 
 // ---- login throttle (in-memory, per-IP brute-force slowdown) ---------------
 
-const attempts = new Map(); // ip -> { fails, until }
+const attempts = new Map(); // ip -> { fails, until, seen }
+const ATTEMPTS_MAX_ENTRIES = 10_000; // bound memory against IP-rotating floods
+const ATTEMPTS_IDLE_MS = 60 * 60 * 1000; // forget an IP after an hour of quiet
+
+// Drop entries that have gone quiet, then — if still over the cap — evict the
+// least-recently-seen ones. Keeps the map from growing without bound when an
+// attacker rotates source IPs.
+function pruneAttempts() {
+  const now = Date.now();
+  for (const [ip, rec] of attempts) {
+    if (rec.until <= now && now - (rec.seen || 0) > ATTEMPTS_IDLE_MS) attempts.delete(ip);
+  }
+  if (attempts.size > ATTEMPTS_MAX_ENTRIES) {
+    const oldest = [...attempts.entries()]
+      .sort((a, b) => (a[1].seen || 0) - (b[1].seen || 0))
+      .slice(0, attempts.size - ATTEMPTS_MAX_ENTRIES);
+    for (const [ip] of oldest) attempts.delete(ip);
+  }
+}
 
 function loginThrottle() {
   return (req, res, next) => {
@@ -146,12 +202,14 @@ function loginThrottle() {
 }
 
 function recordLoginFailure(ip) {
-  const rec = attempts.get(ip) || { fails: 0, until: 0 };
+  const rec = attempts.get(ip) || { fails: 0, until: 0, seen: 0 };
   rec.fails += 1;
+  rec.seen = Date.now();
   if (rec.fails >= 5) {
     rec.until = Date.now() + Math.min(2 ** (rec.fails - 5) * 1000, 60_000);
   }
   attempts.set(ip, rec);
+  if (attempts.size > ATTEMPTS_MAX_ENTRIES) pruneAttempts();
 }
 
 function recordLoginSuccess(ip) {
@@ -164,11 +222,13 @@ module.exports = {
   verifyPassword,
   verifyCredentials,
   ensureAuthSeed,
+  rotateAuthSecret,
   passwordIsDefault,
   issueSession,
   clearSession,
   readSession,
   requireAuth,
+  requireNonDefaultPassword,
   loginThrottle,
   recordLoginFailure,
   recordLoginSuccess,

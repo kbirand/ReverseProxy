@@ -31,6 +31,20 @@ fi
 
 echo "[update] fetching origin/$BRANCH ..."
 git fetch --quiet origin "$BRANCH"
+
+# Optional supply-chain guard: when UPDATE_REQUIRE_SIGNED=true, refuse to deploy
+# a commit that is not signed by a trusted key. The root updater pulls and runs
+# code, so operators who want provenance can require signed commits (import the
+# maintainer's key into root's GPG keyring first). Default off to preserve the
+# existing zero-config update flow.
+if [ "${UPDATE_REQUIRE_SIGNED:-false}" = "true" ]; then
+  echo "[update] verifying signature of origin/$BRANCH (UPDATE_REQUIRE_SIGNED=true) ..."
+  if ! git verify-commit "origin/$BRANCH"; then
+    echo "[update] ABORT — origin/$BRANCH is not a validly signed commit."
+    exit 1
+  fi
+fi
+
 BEFORE="$(git rev-parse HEAD)"
 git reset --hard "origin/$BRANCH"
 AFTER="$(git rev-parse HEAD)"

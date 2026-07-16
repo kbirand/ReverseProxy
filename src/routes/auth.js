@@ -58,7 +58,11 @@ function buildRouter(database) {
     }
     db.setMeta(database, 'auth_pwhash', auth.hashPassword(next));
     db.setMeta(database, 'auth_pw_is_default', '0');
-    auth.issueSession(res, database, user); // refresh the cookie
+    // Rotate the signing secret so every previously-issued cookie is invalidated
+    // — a stolen session must not survive a password change. Re-issue this
+    // caller's cookie (signed with the new secret) so they stay logged in.
+    auth.rotateAuthSecret(database);
+    auth.issueSession(res, database, user);
     res.json({ ok: true });
   });
 
