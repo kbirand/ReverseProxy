@@ -41,6 +41,7 @@ function parseLine(line) {
     status: Number(e.status) || 0,
     user_agent: (ua || '').slice(0, 300),
     suspicious_path: isProbe(req.uri) ? 1 : 0,
+    size: Number(e.size) || 0,
   };
 }
 

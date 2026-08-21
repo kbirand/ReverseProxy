@@ -1,5 +1,7 @@
 const express = require('express');
 const db = require('../db');
+const breach = require('../breach');
+const explain = require('../explain');
 const { scoreActivity } = require('../activity');
 const { reloadCaddy } = require('../sync');
 const { accessEvents } = require('../access-log');
@@ -158,6 +160,128 @@ function buildRouter(database) {
   });
 
   // Recent raw requests (?limit=, default 200).
+  // Breach analysis: four cross-cutting questions the per-IP and per-host views
+  // cannot answer. Nothing is filtered out — rows carry a `confidence` marker so
+  // a heuristic can never hide a real break-in.
+  r.get('/breach', (req, res) => {
+    const hours = Math.min(720, Math.max(1, Number(req.query.hours) || 24));
+    const acl = db.listRules(database)
+      .filter((x) => x.access_mode === 'whitelist' && (x.deny_ips || '').trim());
+    const hostsWithAcl = new Set(acl.map((x) => x.hostname));
+    // Entries are CIDRs and literals with `#` comments; breach.inAllowlist
+    // understands both. Without this your own LAN reads as an intruder.
+    const allowlistedIps = new Set(
+      acl.flatMap((x) => x.deny_ips.split(/[\n,]+/)
+        .map((v) => v.replace(/#.*$/, '').trim())
+        .filter(Boolean)),
+    );
+    const report = breach.report(database, { hours, hostsWithAcl, allowlistedIps, limit: 25 });
+    // Explanations were paid for; surface the stored ones so a refresh does not
+    // lose them (and does not tempt a second, billable click).
+    const stored = db.getExplanationsMany(database, report.ip_summary.map((r) => r.client_ip), hours);
+    const blocked = new Set(db.listGlobalBlocks(database).map((b) => b.ip));
+    for (const row of report.ip_summary) {
+      const ex = stored[row.client_ip];
+      if (ex) row.explanation = { text: ex.text, model: ex.model, created_at: ex.created_at };
+      // NB: `row.blocked` is the parked-page response COUNT from ipSummary.
+      // Blocklist membership goes under a different name or it destroys it.
+      row.is_blocked = blocked.has(row.client_ip);
+      row.block_guard = breach.blockGuard(row);
+    }
+    res.json(report);
+  });
+
+  // "Explain this" — one row, on demand, sent to Claude via Kie. Deliberately
+  // not a pipeline: the operator chooses each time, and buildPayload strips
+  // query strings so the JWTs this estate puts in URLs never leave the machine.
+  //
+  // Results are cached briefly so a double-click does not bill twice.
+  // Re-asking within this window returns the stored answer unless the operator
+  // explicitly asks again — that is what the `force` flag is for. Without it,
+  // "Explain again" silently returned the cached text and looked broken.
+  const EXPLAIN_TTL_MS = 10 * 60 * 1000;
+
+  // Which endpoints one source touched. Fetched on demand — only ALERT and
+  // WATCH rows offer it, and only when expanded, so the report stays small.
+  r.get('/breach/paths', (req, res) => {
+    const ip = String(req.query.ip || '').trim();
+    if (!ip) return res.status(400).json({ error: 'bad_request', message: 'ip is required' });
+    const hours = Math.min(720, Math.max(1, Number(req.query.hours) || 24));
+    const hostsWithAcl = new Set(
+      db.listRules(database)
+        .filter((x) => x.access_mode === 'whitelist' && (x.deny_ips || '').trim())
+        .map((x) => x.hostname),
+    );
+    res.json({ ip, hours, paths: breach.pathsForIp(database, ip, { hours, hostsWithAcl, limit: 60 }) });
+  });
+
+  // Paste-ready handoff for one source: identity, verdict, counts, the stored
+  // AI assessment and the endpoints reached — with credential query values
+  // stripped, since this text is meant to be pasted elsewhere.
+  r.get('/breach/handoff', (req, res) => {
+    const ip = String(req.query.ip || '').trim();
+    if (!ip) return res.status(400).json({ error: 'bad_request', message: 'ip is required' });
+    const hours = Math.min(720, Math.max(1, Number(req.query.hours) || 24));
+    const acl = db.listRules(database)
+      .filter((x) => x.access_mode === 'whitelist' && (x.deny_ips || '').trim());
+    const hostsWithAcl = new Set(acl.map((x) => x.hostname));
+    const rows = breach.ipSummary(database, {
+      hours,
+      hostsWithAcl,
+      allowlistedIps: new Set(acl.flatMap((x) => x.deny_ips.split(/[\n,]+/)
+        .map((v) => v.replace(/#.*$/, '').trim()).filter(Boolean))),
+      limit: 5000,
+    });
+    const row = rows.find((x) => x.client_ip === ip);
+    if (!row) return res.status(404).json({ error: 'not_found', message: 'No activity for that IP in this window' });
+    const text = breach.formatForHandoff({
+      row,
+      hours,
+      paths: breach.pathsForIp(database, ip, { hours, hostsWithAcl, limit: 60 }),
+      explanation: db.getExplanation(database, ip, hours),
+    });
+    res.json({ ip, hours, text });
+  });
+
+  r.post('/breach/explain', async (req, res) => {
+    const ip = String((req.body || {}).ip || '').trim();
+    if (!ip) return res.status(400).json({ error: 'bad_request', message: 'ip is required' });
+    const hours = Math.min(720, Math.max(1, Number((req.body || {}).hours) || 24));
+
+    const force = !!(req.body || {}).force;
+    const prior = db.getExplanation(database, ip, hours);
+    if (!force && prior && Date.now() - prior.created_at < EXPLAIN_TTL_MS) {
+      return res.json({ ip, text: prior.text, model: prior.model, usage: prior.usage, cached: true });
+    }
+
+    const acl = db.listRules(database)
+      .filter((x) => x.access_mode === 'whitelist' && (x.deny_ips || '').trim());
+    const rows = breach.ipSummary(database, {
+      hours,
+      hostsWithAcl: new Set(acl.map((x) => x.hostname)),
+      allowlistedIps: new Set(acl.flatMap((x) => x.deny_ips.split(/[\n,]+/)
+        .map((v) => v.replace(/#.*$/, '').trim()).filter(Boolean))),
+      limit: 5000,
+    });
+    const row = rows.find((x) => x.client_ip === ip);
+    if (!row) return res.status(404).json({ error: 'not_found', message: 'No activity for that IP in this window' });
+
+    const since = Date.now() - hours * 3600 * 1000;
+    const events = database.prepare(
+      'SELECT uri, status, size, user_agent FROM access_events WHERE client_ip = ? AND ts >= ? ORDER BY size DESC LIMIT 300',
+    ).all(ip, since);
+    if (events.length && events[0].user_agent) row.user_agent = events[0].user_agent;
+
+    try {
+      const payload = explain.buildPayload(row, events);
+      const out = await explain.askClaude(payload, { apiKey: process.env.KIE_API_KEY });
+      db.saveExplanation(database, { ip, hours, text: out.text, model: out.model, usage: out.usage });
+      res.json({ ip, text: out.text, model: out.model, usage: out.usage, cached: false });
+    } catch (e) {
+      res.status(502).json({ error: 'explain_failed', message: e.message });
+    }
+  });
+
   r.get('/recent', (req, res) => {
     res.json({ events: db.recentEvents(database, Number(req.query.limit) || 200) });
   });
@@ -170,6 +294,19 @@ function buildRouter(database) {
   r.post('/blocklist', async (req, res) => {
     const ip = String((req.body && req.body.ip) || '').trim();
     if (!ip) return res.status(400).json({ error: 'bad_input', message: 'ip is required' });
+    // Refuse the self-inflicted cases outright: blocking the LAN gateway or an
+    // allowlisted line would cut the operator off from this dashboard.
+    const acl = db.listRules(database)
+      .filter((x) => x.access_mode === 'whitelist' && (x.deny_ips || '').trim());
+    const allow = new Set(acl.flatMap((x) => x.deny_ips.split(/[\n,]+/)
+      .map((v) => v.replace(/#.*$/, '').trim()).filter(Boolean)));
+    const guard = breach.blockGuard({
+      client_ip: ip,
+      verdict: { level: breach.inAllowlist(ip, allow) ? 'yours' : 'other' },
+    });
+    if (!guard.allowed) {
+      return res.status(409).json({ error: 'refused', message: guard.reason });
+    }
     const note = req.body && req.body.note ? String(req.body.note) : null;
     db.addGlobalBlock(database, ip, note);
     try {

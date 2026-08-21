@@ -1,0 +1,494 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const db = require('./db');
+const breach = require('./breach');
+
+// A host that answers 200 with the SAME byte count for many different paths is
+// serving a fixed body — an SPA catch-all, or the parked block page. Real
+// payloads vary in size. That distinction is the whole point of this module:
+// without it, blocked and non-existent requests read as successful breaches.
+function seed() {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  const ev = (o) => rows.push({
+    ts: now, client_ip: '1.1.1.1', host: 'h', method: 'GET', uri: '/', status: 200,
+    user_agent: 'ua', suspicious_path: 0, size: 100, ...o,
+  });
+  // steamactive: SPA catch-all — 6 different paths, all exactly 881 bytes
+  for (const p of ['/a.php', '/b.php', '/c.php', '/d.php', '/e.php', '/f.php']) {
+    ev({ host: 'steamactive.com', uri: p, size: 881, client_ip: '9.9.9.9' });
+  }
+  // esc: parked block page — 5 different paths, all exactly 3171 bytes
+  for (const p of ['/', '/x', '/y', '/z', '/w']) {
+    ev({ host: 'private.example.com', uri: p, size: 3171, client_ip: '8.8.8.8' });
+  }
+  // a genuine exfil: one IP pulling a large unique payload
+  ev({ host: 'backups.example.com', uri: '/api/backups/download?file=db.sql.gz',
+       size: 37701795, client_ip: '203.0.113.10' });
+  // genuine sensitive read
+  ev({ host: 'catalog.example.com', uri: '/api/system/list?path=/etc',
+       size: 11427, client_ip: '203.0.113.10' });
+  // failures
+  for (let i = 0; i < 4; i++) ev({ host: 'finance.example.com', uri: '/api/clients', status: 401, size: 29, client_ip: '5.5.5.5' });
+  // probing
+  for (let i = 0; i < 3; i++) ev({ host: 'x.com', uri: '/wp-login.php', status: 404, size: 12, suspicious_path: 1, client_ip: '7.7.7.7' });
+  db.insertAccessEvents(d, rows);
+  return d;
+}
+
+test('fixed-body sizes are detected per host', () => {
+  const d = seed();
+  const shells = breach.shellSizes(d, 0);
+  assert.ok(shells.has('steamactive.com|881'), 'SPA catch-all size detected');
+  assert.ok(shells.has('private.example.com|3171'), 'parked page size detected');
+  assert.ok(!shells.has('backups.example.com|37701795'), 'a unique payload is not a shell');
+});
+
+test('gotIn flags shell and blocked responses instead of hiding them', () => {
+  const d = seed();
+  const rows = breach.gotIn(d, { sinceMs: 0 });
+  const uris = rows.map((r) => r.uri);
+  assert.ok(uris.some((u) => u.includes('/api/system/list')), 'real sensitive hit is present');
+  for (const r of rows) {
+    assert.ok(['real', 'likely-shell', 'likely-blocked', 'unknown'].includes(r.confidence));
+  }
+  const real = rows.find((r) => r.uri.includes('/api/system/list'));
+  assert.equal(real.confidence, 'real');
+});
+
+test('nothing is filtered out — everything surfaces with a marker', () => {
+  const d = seed();
+  const rows = breach.gotIn(d, { sinceMs: 0, hostsWithAcl: new Set(['private.example.com']) });
+  assert.ok(rows.length > 0);
+  // the parked-page host is reported, but marked as blocked rather than a breach
+  const parked = rows.filter((r) => r.host === 'private.example.com');
+  if (parked.length) assert.equal(parked[0].confidence, 'likely-blocked');
+});
+
+test('dataOut ranks by bytes and finds the exfil', () => {
+  const d = seed();
+  const rows = breach.dataOut(d, { sinceMs: 0, limit: 5 });
+  assert.equal(rows[0].client_ip, '203.0.113.10');
+  assert.ok(rows[0].bytes >= 37701795);
+});
+
+test('triedAndFailed counts 401/403 per IP', () => {
+  const d = seed();
+  const rows = breach.triedAndFailed(d, { sinceMs: 0 });
+  const r = rows.find((x) => x.client_ip === '5.5.5.5');
+  assert.equal(r.failures, 4);
+});
+
+test('probing counts suspicious paths per IP', () => {
+  const d = seed();
+  const rows = breach.probing(d, { sinceMs: 0 });
+  const r = rows.find((x) => x.client_ip === '7.7.7.7');
+  assert.equal(r.probes, 3);
+});
+
+test('rows with no recorded size are marked unknown, never assumed safe', () => {
+  const d = seed();
+  d.prepare("UPDATE access_events SET size=NULL WHERE uri LIKE '%system/list%'").run();
+  const rows = breach.gotIn(d, { sinceMs: 0 });
+  const r = rows.find((x) => x.uri.includes('system/list'));
+  assert.equal(r.confidence, 'unknown');
+});
+
+// ---- enrichment: identity, outcome, verdict --------------------------------
+// The point of this layer is that the three questions a human asks on seeing a
+// row — who is this, did they get anything, do I care — are answered on the
+// page instead of requiring an investigation each time.
+
+function seedEnrich() {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  const ev = (o) => rows.push({
+    ts: now, client_ip: '1.1.1.1', host: 'h', method: 'GET', uri: '/', status: 200,
+    user_agent: 'ua', suspicious_path: 0, size: 100, ...o,
+  });
+  // a cloud scanner: many paths, every answer is the parked page (fixed body)
+  for (let i = 0; i < 30; i++) {
+    ev({ client_ip: '198.51.100.20', host: 'www.example.com', uri: `/probe${i}`, size: 3171, suspicious_path: 1 });
+  }
+  // the owner, on an allowlist, doing real admin work
+  for (let i = 0; i < 5; i++) {
+    ev({ client_ip: '203.0.113.1', host: 'benchverz.com', uri: `/api/admin/tables/x/${i}`, size: 900 + i });
+  }
+  // an intruder: unique large payloads from a sensitive endpoint
+  ev({ client_ip: '203.0.113.10', host: 'backups.example.com',
+       uri: '/api/backups/download?file=db.sql.gz', size: 37701795 });
+  // someone being refused repeatedly
+  for (let i = 0; i < 25; i++) {
+    ev({ client_ip: '5.5.5.5', host: 'finance.example.com', uri: '/api/clients', status: 401, size: 29 });
+  }
+  db.insertAccessEvents(d, rows);
+  db.upsertIpInfo(d, { ip: '198.51.100.20', rdns: 'x.bc.googleusercontent.com', isp: 'Google LLC',
+    org: 'Google Cloud', asn: 'AS15169', country: 'United States', country_code: 'US',
+    region: '', city: '', is_proxy: 0, is_hosting: 1, is_mobile: 0 });
+  return d;
+}
+
+const OPTS = () => ({
+  sinceMs: 0,
+  hostsWithAcl: new Set(['www.example.com']),
+  allowlistedIps: new Set(['203.0.113.1']),
+});
+
+test('a scanner that received only fixed bodies is called noise, not a breach', () => {
+  const r = breach.ipSummary(seedEnrich(), OPTS()).find((x) => x.client_ip === '198.51.100.20');
+  assert.equal(r.real, 0, 'nothing real was served');
+  assert.equal(r.blocked, 30, 'all answers were the parked page');
+  assert.equal(r.verdict.level, 'noise');
+  assert.match(r.verdict.text, /nothing/i);
+});
+
+test('identity is attached so the IP does not have to be looked up', () => {
+  const r = breach.ipSummary(seedEnrich(), OPTS()).find((x) => x.client_ip === '198.51.100.20');
+  assert.equal(r.org, 'Google Cloud');
+  assert.equal(r.is_hosting, 1);
+  assert.match(r.label, /Google/);
+});
+
+test('an allowlisted IP reading admin endpoints is your own access, not an alert', () => {
+  const r = breach.ipSummary(seedEnrich(), OPTS()).find((x) => x.client_ip === '203.0.113.1');
+  assert.equal(r.verdict.level, 'yours');
+});
+
+test('a real payload from a sensitive endpoint by an unlisted IP is an alert', () => {
+  const r = breach.ipSummary(seedEnrich(), OPTS()).find((x) => x.client_ip === '203.0.113.10');
+  assert.equal(r.verdict.level, 'alert');
+  assert.ok(r.real_sensitive >= 1);
+  assert.match(r.verdict.text, /sensitive/i);
+});
+
+test('repeated refusals are worth watching but are not a breach', () => {
+  const r = breach.ipSummary(seedEnrich(), OPTS()).find((x) => x.client_ip === '5.5.5.5');
+  assert.equal(r.verdict.level, 'watch');
+  assert.equal(r.failures, 25);
+});
+
+test('verdict levels are always one of the known set', () => {
+  for (const r of breach.ipSummary(seedEnrich(), OPTS())) {
+    assert.ok(['alert', 'watch', 'noise', 'yours', 'quiet'].includes(r.verdict.level), r.verdict.level);
+    assert.ok(r.verdict.text.length > 0);
+  }
+});
+
+// ---- rule corrections found by running against real traffic ----------------
+// 1. The allowlist is stored as CIDRs (192.168.1.0/24, 100.64.0.0/10). Matching
+//    it as literal strings flagged the LAN gateway as an ALERT.
+// 2. "Refused N times" fired ahead of "scanner that got nothing", so a Google
+//    Cloud scanner with 258 parked-page responses was ranked WATCH, above real
+//    findings. Being refused is what is *supposed* to happen.
+// 3. Loopback and RFC1918 traffic is this machine talking to itself.
+
+test('an IP inside an allowlisted CIDR counts as your own access', () => {
+  // Uses a PUBLIC range on purpose: a LAN address would match the internal
+  // rule first and prove nothing about CIDR handling.
+  const d = seedEnrich();
+  db.insertAccessEvents(d, [{ ts: Date.now(), client_ip: '203.0.113.2', host: 'h', method: 'GET',
+    uri: '/api/admin/x', status: 200, user_agent: 'u', suspicious_path: 0, size: 4242 }]);
+  const r = breach.ipSummary(d, { ...OPTS(), allowlistedIps: new Set(['203.0.113.0/24']) })
+    .find((x) => x.client_ip === '203.0.113.2');
+  assert.equal(r.verdict.level, 'yours', 'CIDR membership must be honoured');
+  // and the same address outside the range is not
+  const r2 = breach.ipSummary(d, { ...OPTS(), allowlistedIps: new Set(['198.51.100.0/24']) })
+    .find((x) => x.client_ip === '203.0.113.2');
+  assert.notEqual(r2.verdict.level, 'yours');
+});
+
+test('private and loopback addresses are internal, never alerts', () => {
+  const d = seedEnrich();
+  db.insertAccessEvents(d, [{ ts: Date.now(), client_ip: '192.168.1.1', host: 'h', method: 'GET',
+    uri: '/api/admin/x', status: 200, user_agent: 'u', suspicious_path: 0, size: 5150 }]);
+  const r = breach.ipSummary(d, OPTS()).find((x) => x.client_ip === '192.168.1.1');
+  assert.equal(r.verdict.level, 'internal');
+});
+
+test('a scanner that got nothing stays noise even when refused many times', () => {
+  const d = seedEnrich();
+  const rows = [];
+  for (let i = 0; i < 40; i++) {
+    rows.push({ ts: Date.now(), client_ip: '198.51.100.20', host: 'www.example.com', method: 'GET',
+      uri: `/probe-b${i}`, status: 403, user_agent: 'u', suspicious_path: 1, size: 29 });
+  }
+  db.insertAccessEvents(d, rows);
+  const r = breach.ipSummary(d, OPTS()).find((x) => x.client_ip === '198.51.100.20');
+  assert.equal(r.real_sensitive, 0);
+  assert.equal(r.verdict.level, 'noise', 'being refused is the system working, not a finding');
+});
+
+test('verdict levels include the internal bucket', () => {
+  for (const r of breach.ipSummary(seedEnrich(), OPTS())) {
+    assert.ok(['alert', 'watch', 'noise', 'yours', 'internal', 'quiet'].includes(r.verdict.level), r.verdict.level);
+  }
+});
+
+// ---- volume alone is not a signal ------------------------------------------
+// A portfolio that serves video will hand 100+ MB to any engaged visitor. If
+// that reads the same as 100 MB of database dumps, the WATCH bucket fills with
+// ordinary visitors and stops being read. What matters is WHAT left, not how
+// much — so the verdict names the content and the host it came from.
+
+function seedVolume() {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  // a visitor pulling portfolio video from an unprotected public site
+  for (let i = 0; i < 60; i++) {
+    rows.push({ ts: now, client_ip: '198.51.100.30', host: 'portfolio.example.com', method: 'GET',
+      uri: `/images/reel${i}_vid/video.mp4`, status: 200, user_agent: 'iPhone',
+      suspicious_path: 0, size: 2_500_000 });
+  }
+  // an intruder pulling database dumps
+  for (let i = 0; i < 4; i++) {
+    rows.push({ ts: now, client_ip: '203.0.113.10', host: 'backups.example.com', method: 'GET',
+      uri: `/api/backups/download?file=db${i}.sql.gz`, status: 200, user_agent: 'curl',
+      suspicious_path: 0, size: 37_000_000 });
+  }
+  db.insertAccessEvents(d, rows);
+  return d;
+}
+
+test('bulk public media is explained, not flagged as a threat', () => {
+  const r = breach.ipSummary(seedVolume(), { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '198.51.100.30');
+  assert.equal(r.verdict.level, 'quiet', 'a visitor watching portfolio video is not a finding');
+  assert.match(r.verdict.text, /media/i, 'the verdict must say what the content was');
+  assert.match(r.verdict.text, /portfolio\.example\.com/, 'and where it came from');
+});
+
+test('the same volume as database dumps is still an alert', () => {
+  const r = breach.ipSummary(seedVolume(), {
+    sinceMs: 0,
+    hostsWithAcl: new Set(['backups.example.com']),
+    allowlistedIps: new Set(),
+  }).find((x) => x.client_ip === '203.0.113.10');
+  assert.equal(r.verdict.level, 'alert');
+});
+
+test('content mix is reported so the row explains itself', () => {
+  const r = breach.ipSummary(seedVolume(), { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '198.51.100.30');
+  assert.equal(r.top_host, 'portfolio.example.com');
+  assert.ok(r.content.media > 0.9, 'overwhelmingly media');
+  assert.equal(r.content.archive, 0);
+});
+
+test('large identically-sized responses are content, not a catch-all page', () => {
+  // A gallery can serve many files of the same byte size. Treating those as a
+  // shell would report real data leaving as "nothing was served" — the exact
+  // failure this module exists to prevent.
+  const d = db.open(':memory:');
+  const rows = [];
+  for (let i = 0; i < 40; i++) {
+    rows.push({ ts: Date.now(), client_ip: '9.9.9.9', host: 'gallery.example', method: 'GET',
+      uri: `/v${i}.mp4`, status: 200, user_agent: 'u', suspicious_path: 0, size: 2_500_000 });
+  }
+  db.insertAccessEvents(d, rows);
+  const shells = breach.shellSizes(d, 0);
+  assert.ok(!shells.has('gallery.example|2500000'), '2.5 MB is far too large to be a shell page');
+});
+
+// ---- blocking guard ---------------------------------------------------------
+// A one-click block sitting next to your own traffic is a foot-gun: blocking
+// the allowlisted office line or the LAN gateway would cut you off from the very
+// dashboard you are looking at. The guard refuses those outright and explains why.
+
+test('blocking your own allowlisted IP is refused', () => {
+  const g = breach.blockGuard({ client_ip: '203.0.113.2', verdict: { level: 'yours' } });
+  assert.equal(g.allowed, false);
+  assert.match(g.reason, /allowlist/i);
+});
+
+test('blocking the LAN or this machine is refused', () => {
+  for (const ip of ['127.0.0.1', '192.168.1.1']) {
+    const g = breach.blockGuard({ client_ip: ip, verdict: { level: 'internal' } });
+    assert.equal(g.allowed, false, `${ip} must not be blockable`);
+  }
+});
+
+test('an outside source is blockable', () => {
+  const g = breach.blockGuard({ client_ip: '198.51.100.20', verdict: { level: 'noise' } });
+  assert.equal(g.allowed, true);
+});
+
+test('the guard defends itself even when the verdict is missing', () => {
+  assert.equal(breach.blockGuard({ client_ip: '127.0.0.1' }).allowed, false);
+  assert.equal(breach.blockGuard({ client_ip: '10.0.0.5' }).allowed, false);
+  assert.equal(breach.blockGuard({ client_ip: '8.8.8.8' }).allowed, true);
+});
+
+test('`blocked` on a summary row is the parked-page COUNT, not a flag', () => {
+  // Blocklist membership must not be stored under this name. Overwriting it
+  // turned "blocked 258" into "blocked false" in the UI and destroyed the
+  // count that distinguishes a refused scanner from one that got through.
+  const r = breach.ipSummary(seedEnrich(), OPTS()).find((x) => x.client_ip === '198.51.100.20');
+  assert.equal(typeof r.blocked, 'number');
+  assert.equal(r.blocked, 30);
+});
+
+// ---- per-IP path detail -----------------------------------------------------
+// "Reached a sensitive endpoint" is only actionable if you can see WHICH one.
+// Same classification as everywhere else, so a row that looks alarming but was
+// answered with a catch-all page is not mistaken for a real read.
+
+test('paths are grouped by path+status with counts and bytes', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  for (let i = 0; i < 3; i++) {
+    rows.push({ ts: now, client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/api/backups/download?file=a.gz',
+      status: 200, user_agent: 'u', suspicious_path: 0, size: 1000 });
+  }
+  rows.push({ ts: now, client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/api/backups/download?file=a.gz',
+    status: 401, user_agent: 'u', suspicious_path: 0, size: 29 });
+  db.insertAccessEvents(d, rows);
+  const out = breach.pathsForIp(d, '9.9.9.9', { sinceMs: 0 });
+  const ok = out.find((r) => r.status === 200);
+  assert.equal(ok.count, 3);
+  assert.equal(ok.bytes, 3000);
+  assert.ok(out.find((r) => r.status === 401), 'a different status is its own row');
+});
+
+test('path rows carry the same confidence marker as everything else', () => {
+  const d = db.open(':memory:');
+  const rows = [];
+  // six distinct paths sharing one small size => a catch-all page
+  for (let i = 0; i < 6; i++) {
+    rows.push({ ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: `/shell${i}.php`,
+      status: 200, user_agent: 'u', suspicious_path: 1, size: 1132 });
+  }
+  rows.push({ ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/api/system/list?path=/etc',
+    status: 200, user_agent: 'u', suspicious_path: 0, size: 11427 });
+  db.insertAccessEvents(d, rows);
+  const out = breach.pathsForIp(d, '9.9.9.9', { sinceMs: 0 });
+  assert.equal(out.find((r) => r.uri.includes('shell0')).confidence, 'likely-shell');
+  assert.equal(out.find((r) => r.uri.includes('system/list')).confidence, 'real');
+});
+
+test('biggest transfers come first and the list is capped', () => {
+  const d = db.open(':memory:');
+  const rows = [];
+  for (let i = 0; i < 200; i++) {
+    rows.push({ ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: `/f${i}`,
+      status: 200, user_agent: 'u', suspicious_path: 0, size: i * 10 });
+  }
+  db.insertAccessEvents(d, rows);
+  const out = breach.pathsForIp(d, '9.9.9.9', { sinceMs: 0, limit: 25 });
+  assert.equal(out.length, 25);
+  assert.ok(out[0].bytes >= out[1].bytes, 'ordered by bytes desc');
+});
+
+test('an IP with no traffic yields an empty list, not a throw', () => {
+  assert.deepEqual(breach.pathsForIp(db.open(':memory:'), '1.1.1.1', { sinceMs: 0 }), []);
+});
+
+// ---- handoff text -----------------------------------------------------------
+// A block the operator can paste elsewhere for a second opinion. It leaves the
+// machine by definition, so credential-bearing query parameters are redacted
+// here the same way explain.js redacts them — the difference being that a path
+// like ?file=db.sql.gz is evidence and must survive.
+
+test('credential-bearing query parameters are redacted, the rest survives', () => {
+  const u = breach.redactQuery('/api/backups/download?host=BravoNew&file=db.sql.gz&token=eyJhbGciOiJI.SECRET.sig');
+  assert.match(u, /host=BravoNew/, 'ordinary parameters are evidence, keep them');
+  assert.match(u, /file=db\.sql\.gz/, 'the filename is the whole point');
+  assert.doesNotMatch(u, /eyJ|SECRET/, 'the token must not survive');
+  assert.match(u, /token=REDACTED/);
+});
+
+test('every credential-ish parameter name is covered', () => {
+  for (const k of ['token', 'access_token', 'api_key', 'apikey', 'key', 'secret', 'password', 'sig', 'signature', 'auth']) {
+    const out = breach.redactQuery(`/x?${k}=SUPERSECRETVALUE`);
+    assert.doesNotMatch(out, /SUPERSECRETVALUE/, `${k} leaked`);
+  }
+});
+
+test('a path with no query string is untouched', () => {
+  assert.equal(breach.redactQuery('/api/system/list'), '/api/system/list');
+});
+
+test('handoff text carries identity, verdict, counts, explanation and endpoints', () => {
+  const text = breach.formatForHandoff({
+    hours: 24,
+    row: {
+      client_ip: '203.0.113.10', label: 'Example ISP · XX', requests: 2367, bytes: 974000000,
+      real: 1853, blocked: 56, shell: 324, unknown: 0, failures: 73, distinct_paths: 1893, hosts: 17,
+      top_host: 'films.example.com', content: { media: 0.67, api: 0.17, archive: 0, code: 0.01, other: 0.15 },
+      verdict: { level: 'alert', text: 'Reached a sensitive endpoint.' },
+      first_ts: 1787250000000, last_ts: 1787260000000, is_hosting: 0,
+    },
+    explanation: { text: 'Systematic mirroring.', model: 'claude-opus-5', created_at: 1787300000000 },
+    paths: [{ host: 'backups.example.com', uri: '/api/backups/download?file=db.sql.gz&token=eyJx.Y.Z',
+              method: 'GET', status: 200, bytes: 113100000, count: 3, confidence: 'real', last_ts: 1787260000000 }],
+  });
+  assert.match(text, /203\.0\.113\.10/);
+  assert.match(text, /ALERT/);
+  assert.match(text, /real 1853/);
+  assert.match(text, /Example ISP/);
+  assert.match(text, /Systematic mirroring/);
+  assert.match(text, /claude-opus-5/);
+  assert.match(text, /api\/backups\/download/);
+  assert.doesNotMatch(text, /eyJx/, 'tokens must not ride along in a paste');
+});
+
+test('handoff text is fine with no explanation and no paths', () => {
+  const text = breach.formatForHandoff({
+    hours: 1,
+    row: { client_ip: '8.8.8.8', requests: 1, bytes: 0, real: 0, blocked: 0, shell: 0, unknown: 0,
+           failures: 0, distinct_paths: 1, hosts: 1, verdict: { level: 'quiet', text: 'Ordinary.' },
+           first_ts: 1, last_ts: 2 },
+  });
+  assert.match(text, /8\.8\.8\.8/);
+  assert.match(text, /no AI assessment/i);
+});
+
+// ---- status must outrank size in the path detail ---------------------------
+// The size classifier answers "was this body real content or a stock page?" —
+// a question that only makes sense for a response that served something. Run
+// over a 403 it labelled refusals "real", which is precisely the confusion the
+// confidence marker exists to prevent.
+
+test('refusals are marked refused, never real', () => {
+  const d = db.open(':memory:');
+  db.insertAccessEvents(d, [
+    { ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/wp-admin/install.php',
+      status: 403, user_agent: 'u', suspicious_path: 1, size: 30 },
+    { ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/locked',
+      status: 401, user_agent: 'u', suspicious_path: 0, size: 29 },
+  ]);
+  for (const p of breach.pathsForIp(d, '9.9.9.9', { sinceMs: 0 })) {
+    assert.equal(p.confidence, 'refused', `${p.status} must be 'refused', got '${p.confidence}'`);
+  }
+});
+
+test('404 is reported as not-found, and 5xx as error', () => {
+  const d = db.open(':memory:');
+  db.insertAccessEvents(d, [
+    { ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/missing',
+      status: 404, user_agent: 'u', suspicious_path: 0, size: 150 },
+    { ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/boom',
+      status: 500, user_agent: 'u', suspicious_path: 0, size: 87 },
+  ]);
+  const out = breach.pathsForIp(d, '9.9.9.9', { sinceMs: 0 });
+  assert.equal(out.find((p) => p.status === 404).confidence, 'not-found');
+  assert.equal(out.find((p) => p.status === 500).confidence, 'error');
+});
+
+test('served responses still get the size-based verdict', () => {
+  const d = db.open(':memory:');
+  const rows = [];
+  for (let i = 0; i < 6; i++) {
+    rows.push({ ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: `/s${i}`,
+      status: 200, user_agent: 'u', suspicious_path: 0, size: 1132 });
+  }
+  rows.push({ ts: Date.now(), client_ip: '9.9.9.9', host: 'h', method: 'GET', uri: '/real',
+    status: 200, user_agent: 'u', suspicious_path: 0, size: 99999 });
+  db.insertAccessEvents(d, rows);
+  const out = breach.pathsForIp(d, '9.9.9.9', { sinceMs: 0 });
+  assert.equal(out.find((p) => p.uri === '/s0').confidence, 'likely-shell');
+  assert.equal(out.find((p) => p.uri === '/real').confidence, 'real');
+});

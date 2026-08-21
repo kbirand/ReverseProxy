@@ -29,6 +29,7 @@
       <button id="nav-activity" class="nav-btn">Activity</button>
       <button id="nav-blocklist" class="nav-btn">Blocklist</button>
       <button id="nav-firewall" class="nav-btn">Firewall</button>
+      <button id="nav-breach" class="nav-btn">Breach</button>
     </nav>
     <div class="status" id="status">…</div>
     <input type="search" id="search" class="search rules-only" placeholder="Filter — try *.com or api* or 3001"
@@ -38,6 +39,7 @@
       <button id="btn-new" class="primary rules-only">+ New rule</button>
       <button id="btn-reload">Reload Caddy</button>
       <button id="btn-maintenance" title="Show a maintenance page on selected domains">Maintenance</button>
+      <button id="btn-blockpage" title="What an IP-blocked visitor sees: a neutral parked-domain page, or a bare 403">Block page</button>
       <button id="btn-backup" title="Backup &amp; restore configuration">Backup</button>
       <button id="btn-password" title="Change the admin password">Password</button>
       <button id="btn-logout">Logout</button>
@@ -161,6 +163,23 @@
         <thead><tr><th>IP / CIDR</th><th>Added</th><th>Note</th><th></th></tr></thead>
         <tbody id="blocklist-body"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
       </table>
+    </div>
+
+    <div id="view-breach" hidden>
+      <div class="activity-toolbar">
+        <label class="inline">Window
+          <select id="breach-window">
+            <option value="1">last 1 h</option>
+            <option value="24" selected>last 24 h</option>
+            <option value="168">last 7 d</option>
+            <option value="720">last 30 d</option>
+          </select>
+        </label>
+        <button id="breach-refresh">Refresh</button>
+        <span class="grow"></span>
+        <span class="muted" id="breach-stats"></span>
+      </div>
+      <div id="breach-panels"></div>
     </div>
 
     <div id="view-firewall" hidden>

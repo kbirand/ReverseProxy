@@ -5,6 +5,8 @@ const auth = require('./auth');
 const { caddyHealthy } = require('./caddy');
 const { reloadCaddy, scheduleMaintenanceAutoEnd } = require('./sync');
 const { startIngester } = require('./access-log');
+const breach = require('./breach');
+const notify = require('./notify');
 const rulesRoute = require('./routes/rules');
 const systemRoute = require('./routes/system');
 const activityRoute = require('./routes/activity');
@@ -83,10 +85,52 @@ function warnIfInsecure() {
   }
 }
 
+// Watch for a genuinely serious source and push it to the operator's phone.
+// Scope is a 1h window: long enough that a slow exfiltration still shows a full
+// picture, short enough that an old incident does not re-alert forever. Only
+// ALERT verdicts qualify, and notify.js keeps a 6h cooldown per source.
+function startBreachWatcher(database) {
+  const topic = (process.env.NTFY_TOPIC || '').trim();
+  if (!topic) {
+    console.log('[rproxy-ui] breach alerts disabled (NTFY_TOPIC not set)');
+    return null;
+  }
+  const server = process.env.NTFY_SERVER || notify.DEFAULT_SERVER;
+  const every = Math.max(30, Number(process.env.BREACH_WATCH_SECONDS) || 60) * 1000;
+  console.log(`[rproxy-ui] breach alerts on: ${server}/${topic.slice(0, 4)}… every ${every / 1000}s`);
+
+  const tick = async () => {
+    try {
+      const acl = db.listRules(database)
+        .filter((x) => x.access_mode === 'whitelist' && (x.deny_ips || '').trim());
+      const rows = breach.ipSummary(database, {
+        hours: 1,
+        hostsWithAcl: new Set(acl.map((x) => x.hostname)),
+        allowlistedIps: new Set(acl.flatMap((x) => x.deny_ips.split(/[\n,]+/)
+          .map((v) => v.replace(/#.*$/, '').trim()).filter(Boolean))),
+        limit: 200,
+      });
+      const sent = await notify.runOnce(database, rows, {
+        server,
+        topic,
+        token: process.env.NTFY_TOKEN || '',
+        onError: (ip, reason) => console.error(`[rproxy-ui] breach alert for ${ip} failed: ${reason}`),
+      });
+      for (const ip of sent) console.warn(`[rproxy-ui] BREACH ALERT sent for ${ip}`);
+    } catch (e) {
+      // Never let the watcher take the UI down.
+      console.error(`[rproxy-ui] breach watcher error: ${e.message}`);
+    }
+  };
+  tick();
+  return setInterval(tick, every);
+}
+
 app.listen(PORT, BIND, () => {
   console.log(`[rproxy-ui] listening on ${BIND}:${PORT}`);
   warnIfInsecure();
   syncOnStartup();
   // Tail Caddy's access log into SQLite for the activity view.
   startIngester(database);
+  startBreachWatcher(database);
 });

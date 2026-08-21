@@ -8,7 +8,10 @@ async function reloadCaddy(database) {
   const rules = db.listRules(database);
   const globalBlocks = db.listGlobalBlocks(database).map((b) => b.ip);
   const maintenance = db.getMaintenance(database);
-  await pushConfig(renderConfig(rules, { globalBlocks, maintenance }));
+  // Parked block page for IP-rejected visitors. On unless explicitly disabled,
+  // so a fresh install does not advertise "Forbidden" on protected hostnames.
+  const blockPage = db.getMeta(database, 'block_page') !== '0';
+  await pushConfig(renderConfig(rules, { globalBlocks, maintenance, blockPage }));
   db.setMeta(database, 'last_reload_at', Date.now());
   return { rules: rules.length, blocks: globalBlocks.length, maintenance };
 }

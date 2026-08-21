@@ -200,6 +200,26 @@ function buildRouter(database) {
     res.json({ ok: true, maintenance: state });
   });
 
+  // Read the parked block page setting (shown to IP-rejected visitors).
+  r.get('/block-page', (req, res) => {
+    res.json({ enabled: db.getMeta(database, 'block_page') !== '0' });
+  });
+
+  // Turn the parked block page on/off. Off restores the historical bare 403.
+  r.post('/block-page', async (req, res) => {
+    const enabled = !!(req.body || {}).enabled;
+    const prev = db.getMeta(database, 'block_page');
+    db.setMeta(database, 'block_page', enabled ? '1' : '0');
+    try {
+      await reloadCaddy(database);
+    } catch (e) {
+      // Restore the previous value; unset behaves the same as '1' (on).
+      db.setMeta(database, 'block_page', prev === null ? '1' : prev);
+      return res.status(502).json({ error: 'caddy_rejected', message: e.message, body: e.body });
+    }
+    res.json({ ok: true, enabled });
+  });
+
   // Trigger a self-update by dropping the request file. systemd's
   // rproxy-update.path notices it and starts the privileged updater.
   r.post('/update', (req, res) => {

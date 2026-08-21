@@ -368,3 +368,89 @@ th.check-col, td.check-col {
 }
 #activity-bulk-count { font-size: 13px; font-weight: 600; color: var(--text); }
 .bulk-actions { display: flex; gap: 8px; }
+
+/* ---- breach view ---- */
+.breach-panel { margin: 18px 0 26px; }
+.breach-panel h3 { margin: 0 0 4px; font-size: 16px; }
+.breach-panel > p.muted { margin: 0 0 10px; font-size: 13px; }
+
+/* The assessment column holds long prose and the actions column holds
+   nowrap buttons. Without explicit sizing the table grows past 100% and the
+   row rules stop at the container edge while the buttons hang outside it. */
+.breach-panel .tbl {
+  width: 100%; max-width: 100%; table-layout: fixed;
+  border-collapse: collapse; font-size: 13px;
+}
+.breach-panel .tbl th {
+  text-align: left; font-weight: 600; padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #d8dcdc); white-space: nowrap;
+}
+.breach-panel .tbl td {
+  padding: 5px 10px; border-bottom: 1px solid var(--border-soft, #eceeee);
+  vertical-align: top; overflow-wrap: anywhere;
+}
+.breach-panel .tbl col.c-verdict { width: 84px; }
+.breach-panel .tbl col.c-source  { width: 19%; }
+.breach-panel .tbl col.c-recv    { width: 19%; }
+.breach-panel .tbl col.c-assess  { width: auto; }
+.breach-panel .tbl col.c-act     { width: 320px; }
+/* NB: do NOT name this `row-actions`. The app already defines that class as
+   `display:flex` (styles.css ~line 198), and a <td> set to flex stops being a
+   table cell: it drops out of the table layout, loses its bottom border, and
+   its buttons render outside the row. That was the broken-rules bug here.
+   Width is sized for the widest label pair, "Explain again" + "Block". */
+/* Buttons live in a flex DIV inside the cell, never on the <td> itself — a
+   <td> set to display:flex stops being a table cell and drops out of the row
+   (that was the broken-rules bug). nowrap keeps the longest combination —
+   "Explain again · Details · Copy · Unblock" — on one line. */
+.breach-panel .tbl td.breach-actions { text-align: right; }
+.breach-panel .tbl td.breach-actions .breach-btns {
+  display: flex; flex-wrap: nowrap; justify-content: flex-end;
+  align-items: flex-start; gap: 5px;
+}
+.breach-panel .tbl td span.muted { display: block; font-size: 12px; overflow-wrap: anywhere; }
+
+/* An explanation owns a full-width row of its own. The summary row above it
+   drops its bottom rule so the pair reads as one record, rather than the prose
+   appearing to belong to the row below. An empty slot contributes nothing. */
+.breach-panel .tbl tr.has-explanation > td { border-bottom: 0; }
+.breach-panel .tbl tr.explain-row > td {
+  padding: 0 10px 12px; border-bottom: 1px solid var(--border-soft, #eceeee);
+}
+.breach-panel .tbl tr.explain-row > td:empty { padding: 0; border-bottom: 0; }
+.breach-panel .tbl tr.explain-row .explain-out { margin: 0; }
+
+.breach-panel h4.conf { margin: 14px 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; cursor: help; }
+h4.conf-real { color: #b3261e; }
+h4.conf-unknown { color: #8a6d00; }
+h4.conf-likely-blocked { color: #1d7a4c; }
+h4.conf-likely-shell { color: #6b7280; }
+
+.vd { display:inline-block; padding:2px 7px; border-radius:3px; font-size:11px; font-weight:700; letter-spacing:.05em; color:#fff; }
+.vd-alert{background:#b3261e} .vd-watch{background:#b26a00} .vd-noise{background:#6b7280}
+.vd-quiet{background:#8a9199} .vd-yours{background:#1d7a4c} .vd-internal{background:#3f5a8a}
+
+.breach-actions button { font-size:12px; padding:3px 8px; white-space:nowrap; flex:0 0 auto; }
+.block-btn[disabled] { opacity:.4; cursor:not-allowed; }
+.unblock-btn { border-color:#1d7a4c; color:#1d7a4c; }
+
+.explain-slot:empty { display:none; }
+.explain-out { padding:9px 11px; border-left:3px solid #6b7280;
+  background:rgba(127,127,127,.07); border-radius:0 4px 4px 0; font-size:13px; line-height:1.5; white-space:pre-wrap; }
+.explain-out.err { border-left-color:#b3261e; }
+.explain-out span.muted { display:block; margin-top:6px; font-size:11px; }
+
+/* Expandable endpoint detail, shown only on ALERT/WATCH rows. Its own
+   full-width row so expanding never shifts the summary columns. */
+.breach-panel .tbl tr.has-explanation > td,
+.breach-panel .tbl tr.has-detail > td { border-bottom: 0; }
+.breach-panel .tbl tr.detail-row > td { padding: 0 10px 14px; border-bottom: 1px solid var(--border-soft, #eceeee); }
+.paths-tbl { width: 100%; table-layout: auto; margin-top: 2px; font-size: 12px; }
+.paths-tbl th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.paths-tbl td { padding: 4px 8px; }
+.paths-tbl td.pth { overflow-wrap: anywhere; }
+.paths-tbl td.pth span.muted { display: block; font-size: 11px; }
+.cf { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:700; letter-spacing:.04em; color:#fff; cursor:help; }
+.cf-real{background:#b3261e} .cf-likely-blocked{background:#1d7a4c}
+.cf-likely-shell{background:#6b7280} .cf-unknown{background:#8a6d00}
+.cf-refused{background:#1d7a4c} .cf-not-found{background:#5a6672} .cf-error{background:#8a6d00}

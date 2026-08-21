@@ -49,10 +49,28 @@ function migrate(db) {
       uri             TEXT,
       status          INTEGER,
       user_agent      TEXT,
-      suspicious_path INTEGER NOT NULL DEFAULT 0
+      suspicious_path INTEGER NOT NULL DEFAULT 0,
+      size            INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_access_ts ON access_events(ts);
     CREATE INDEX IF NOT EXISTS idx_access_ip ON access_events(client_ip);
+
+    CREATE TABLE IF NOT EXISTS explanations (
+      ip           TEXT NOT NULL,
+      window_hours INTEGER NOT NULL,
+      text         TEXT NOT NULL,
+      model        TEXT,
+      usage        TEXT,
+      created_at   INTEGER NOT NULL,
+      PRIMARY KEY (ip, window_hours)
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      ip      TEXT NOT NULL,
+      kind    TEXT NOT NULL,
+      sent_at INTEGER NOT NULL,
+      PRIMARY KEY (ip, kind)
+    );
 
     CREATE TABLE IF NOT EXISTS global_blocks (
       ip       TEXT PRIMARY KEY,
@@ -87,6 +105,13 @@ function migrate(db) {
   }
   if (!cols.includes('access_mode')) {
     db.exec("ALTER TABLE rules ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'blacklist'");
+  }
+  // Response size: needed to tell a real payload from an SPA catch-all shell or
+  // the parked block page, both of which answer 200. Older rows stay NULL.
+  try {
+    db.exec('ALTER TABLE access_events ADD COLUMN size INTEGER');
+  } catch {
+    // already present
   }
 }
 
@@ -271,8 +296,8 @@ const ACCESS_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 function insertAccessEvents(db, events) {
   if (!events.length) return;
   const stmt = db.prepare(`
-    INSERT INTO access_events (ts, client_ip, host, method, uri, status, user_agent, suspicious_path)
-    VALUES (@ts, @client_ip, @host, @method, @uri, @status, @user_agent, @suspicious_path)
+    INSERT INTO access_events (ts, client_ip, host, method, uri, status, user_agent, suspicious_path, size)
+    VALUES (@ts, @client_ip, @host, @method, @uri, @status, @user_agent, @suspicious_path, @size)
   `);
   const tx = db.transaction((rows) => { for (const r of rows) stmt.run(r); });
   tx(events);
@@ -571,6 +596,46 @@ function importBackup(db, data, opts = {}) {
   };
 }
 
+// ---- breach explanations ---------------------------------------------------
+// Each one costs an API call, so they are stored rather than held in memory:
+// a page refresh must not throw away something that was paid for.
+
+function saveExplanation(db, { ip, hours, text, model, usage }) {
+  db.prepare(`
+    INSERT INTO explanations (ip, window_hours, text, model, usage, created_at)
+    VALUES (@ip, @hours, @text, @model, @usage, @created_at)
+    ON CONFLICT(ip, window_hours) DO UPDATE SET
+      text = excluded.text, model = excluded.model,
+      usage = excluded.usage, created_at = excluded.created_at
+  `).run({
+    ip, hours, text, model: model || null,
+    usage: usage ? JSON.stringify(usage) : null,
+    created_at: Date.now(),
+  });
+}
+
+function parseExplanation(row) {
+  if (!row) return null;
+  let usage = null;
+  try { usage = row.usage ? JSON.parse(row.usage) : null; } catch { usage = null; }
+  return { ...row, usage };
+}
+
+function getExplanation(db, ip, hours) {
+  return parseExplanation(
+    db.prepare('SELECT * FROM explanations WHERE ip = ? AND window_hours = ?').get(ip, hours),
+  );
+}
+
+function getExplanationsMany(db, ips, hours) {
+  if (!ips || !ips.length) return {};
+  const ph = ips.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT * FROM explanations WHERE window_hours = ? AND ip IN (${ph})`,
+  ).all(hours, ...ips);
+  return Object.fromEntries(rows.map((r) => [r.ip, parseExplanation(r)]));
+}
+
 module.exports = {
   open,
   listRules,
@@ -594,6 +659,9 @@ module.exports = {
   getIpInfo,
   getIpInfoMany,
   upsertIpInfo,
+  saveExplanation,
+  getExplanation,
+  getExplanationsMany,
   listGlobalBlocks,
   addGlobalBlock,
   removeGlobalBlock,

@@ -214,6 +214,354 @@ async function api(method, path, body) {
   return data;
 }
 
+// ---- parked block page -----------------------------------------------------
+// What a visitor rejected by IP access control sees. A bare 403 announces that
+// something private lives on the hostname; the parked page announces nothing.
+
+function renderBlockPageBtn(enabled) {
+  const b = $('#btn-blockpage');
+  if (!b) return;
+  b.textContent = enabled ? 'Block page: parked' : 'Block page: 403';
+  b.dataset.on = enabled ? '1' : '0';
+}
+
+async function refreshBlockPage() {
+  try {
+    const { enabled } = await api('GET', '/system/block-page');
+    renderBlockPageBtn(enabled);
+  } catch { /* non-fatal: leave the neutral label */ }
+}
+
+async function onToggleBlockPage() {
+  const btn = $('#btn-blockpage');
+  const next = btn.dataset.on !== '1';
+  btn.disabled = true;
+  try {
+    const { enabled } = await api('POST', '/system/block-page', { enabled: next });
+    renderBlockPageBtn(enabled);
+    showError('');
+  } catch (e) {
+    showError(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---- breach view -----------------------------------------------------------
+// Answers "did anyone get in", which the per-IP and per-host views do not.
+// Confidence markers matter more than the rows: two things here answer 200
+// without serving anything (SPA catch-alls, and the parked block page), so an
+// unmarked list of "2xx on an admin path" is mostly false alarms.
+
+const VERDICT_LABEL = {
+  alert:    ['ALERT',    'Received real content from a protected endpoint'],
+  watch:    ['WATCH',    'Nothing sensitive served, but worth a look'],
+  noise:    ['NOISE',    'Automated scanning that got nothing'],
+  quiet:    ['QUIET',    'Ordinary traffic'],
+  yours:    ['YOURS',    'An IP on one of your allowlists'],
+  internal: ['INTERNAL', 'This machine or your local network'],
+};
+
+const CONF_LABEL = {
+  real: ['real', 'Response body is unique to this request — treat as a genuine read'],
+  'likely-blocked': ['blocked', 'Byte-identical to this host\'s parked block page — the visitor was refused'],
+  'likely-shell': ['shell', 'Byte-identical to this host\'s catch-all page — no data was served'],
+  unknown: ['unknown', 'No response size recorded — cannot tell. Do not assume safe'],
+};
+
+function bytesH(n) {
+  if (n == null) return '—';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + ' kB';
+  return n + ' B';
+}
+const tsH = (ms) => new Date(ms).toLocaleString();
+
+function panel(title, subtitle, bodyHtml) {
+  return `<section class="breach-panel"><h3>${escapeHtml(title)}</h3>`
+       + `<p class="muted">${escapeHtml(subtitle)}</p>${bodyHtml}</section>`;
+}
+
+function renderBreach(rep) {
+  const out = [];
+
+  // Who was here, what they actually got, and whether it matters — so the page
+  // answers the question instead of prompting an investigation.
+  const sum = rep.ip_summary || [];
+  out.push(panel('Who was here',
+    'Every source in this window, worst first. The verdict is computed from what was actually served — not from how alarming the path looked.',
+    sum.length ? '<table class="tbl">'
+    + '<colgroup><col class="c-verdict"><col class="c-source"><col class="c-recv"><col class="c-assess"><col class="c-act"></colgroup>'
+    + '<thead><tr><th>Verdict</th><th>Source</th><th>Received</th><th>Assessment</th><th></th></tr></thead><tbody>'
+    + sum.map((r) => {
+      const [lab, help] = VERDICT_LABEL[r.verdict.level] || ['?', ''];
+      return `<tr class="${r.explanation ? 'has-explanation' : ''}">`
+        + `<td><span class="vd vd-${r.verdict.level}" title="${escapeHtml(help)}">${lab}</span></td>`
+        + `<td><code>${escapeHtml(r.client_ip)}</code>${r.label ? `<span class="muted">${escapeHtml(r.label)}</span>` : ''}</td>`
+        + `<td>${r.requests} reqs · ${bytesH(r.bytes)}<span class="muted">`
+        + `real ${r.real} · blocked ${r.blocked} · shell ${r.shell} · unknown ${r.unknown} · ${r.failures} refused</span></td>`
+        + `<td>${escapeHtml(r.verdict.text)}`
+        + `</td>`
+        + `<td class="breach-actions"><div class="breach-btns">`
+        + `<button class="explain-btn" data-ip="${escapeHtml(r.client_ip)}"`
+        + ` title="Ask Claude to assess this one source. Sends aggregate figures and paths with query strings removed — never headers or tokens. Each fresh answer costs an API call.">`
+        + `${r.explanation ? 'Explain again' : 'Explain'}</button>`
+        + detailBtnHtml(r)
+        + copyBtnHtml(r)
+        + blockBtnHtml(r)
+        + `</div></td></tr>`
+        // Explanation, then detail — each in a full-width row of its own.
+        // Nesting either inside the Assessment cell stretched that column and
+        // knocked every rule out of alignment.
+        + `<tr class="explain-row"><td colspan="5" class="explain-slot" id="ex-${slotId(r.client_ip)}">`
+        + `${r.explanation ? explainHtml(r.explanation) : ''}</td></tr>`
+        + `<tr class="detail-row" id="dt-${slotId(r.client_ip)}" hidden><td colspan="5"></td></tr>`;
+    }).join('') + '</tbody></table>'
+    : '<p class="muted">No traffic in this window.</p>'));
+
+  out.push(panel('Data out', 'Bytes leaving, by who pulled them. Exfiltration is loud here and invisible everywhere else.',
+    rep.data_out.length ? `<table class="tbl"><thead><tr><th>Bytes</th><th>Requests</th><th>Largest</th><th>Client IP</th><th>Host</th><th>Last seen</th></tr></thead><tbody>`
+    + rep.data_out.map((r) => `<tr><td><strong>${bytesH(r.bytes)}</strong></td><td>${r.requests}</td><td>${bytesH(r.largest)}</td>`
+    + `<td><code>${escapeHtml(r.client_ip)}</code></td><td>${escapeHtml(r.host)}</td><td class="muted">${tsH(r.last_ts)}</td></tr>`).join('')
+    + '</tbody></table>' : '<p class="muted">Nothing recorded in this window.</p>'));
+
+  const groups = { real: [], 'likely-blocked': [], 'likely-shell': [], unknown: [] };
+  for (const r of rep.got_in) (groups[r.confidence] || groups.unknown).push(r);
+  const gi = ['real', 'unknown', 'likely-blocked', 'likely-shell'].map((k) => {
+    const rows = groups[k];
+    if (!rows.length) return '';
+    const [label, help] = CONF_LABEL[k];
+    return `<h4 class="conf conf-${k}" title="${escapeHtml(help)}">${escapeHtml(label)} — ${rows.length}</h4>`
+      + '<table class="tbl"><tbody>'
+      + rows.slice(0, 40).map((r) => `<tr><td class="muted">${tsH(r.ts)}</td><td>${r.status}</td>`
+        + `<td>${bytesH(r.size)}</td><td><code>${escapeHtml(r.client_ip)}</code></td>`
+        + `<td>${escapeHtml(r.host)}<span class="muted">${escapeHtml(r.uri.slice(0, 70))}</span></td></tr>`).join('')
+      + '</tbody></table>';
+  }).join('');
+  out.push(panel('Reached a sensitive endpoint',
+    'Every 2xx on an admin, backup, user or filesystem path — nothing hidden, each row marked with how much to trust it.',
+    gi || '<p class="muted">No sensitive endpoint was reached in this window.</p>'));
+
+  out.push(panel('Tried and failed', 'Repeated 401/403. A cluster here is someone working at a door that held.',
+    rep.tried_and_failed.length ? '<table class="tbl"><thead><tr><th>Failures</th><th>Hosts</th><th>Client IP</th><th>Last seen</th></tr></thead><tbody>'
+    + rep.tried_and_failed.map((r) => `<tr><td><strong>${r.failures}</strong></td><td>${r.hosts}</td>`
+    + `<td><code>${escapeHtml(r.client_ip)}</code></td><td class="muted">${tsH(r.last_ts)}</td></tr>`).join('')
+    + '</tbody></table>' : '<p class="muted">None.</p>'));
+
+  out.push(panel('Probing', 'Scanners walking known-vulnerable paths. Mostly background noise — worth watching for volume, not panic.',
+    rep.probing.length ? '<table class="tbl"><thead><tr><th>Probes</th><th>Distinct paths</th><th>Client IP</th><th>Last seen</th></tr></thead><tbody>'
+    + rep.probing.map((r) => `<tr><td><strong>${r.probes}</strong></td><td>${r.distinct_paths}</td>`
+    + `<td><code>${escapeHtml(r.client_ip)}</code></td><td class="muted">${tsH(r.last_ts)}</td></tr>`).join('')
+    + '</tbody></table>' : '<p class="muted">None.</p>'));
+
+  $('#breach-panels').innerHTML = out.join('');
+  const alerts = sum.filter((r) => r.verdict.level === 'alert').length;
+  const watch = sum.filter((r) => r.verdict.level === 'watch').length;
+  $('#breach-stats').textContent = alerts
+    ? `${alerts} source${alerts === 1 ? '' : 's'} reached a sensitive endpoint · ${watch} to review`
+    : `Nothing reached a sensitive endpoint · ${watch} to review`;
+}
+
+// One row, one click, one request. Not a background pipeline: every call is a
+// deliberate act by the operator, and it is billed.
+// The slot id must be derived identically when rendering and when updating,
+// otherwise the answer lands nowhere and the button appears to do nothing.
+// Blocking is global and takes effect immediately, so the button states its
+// consequence rather than hiding it. Rows the guard refuses render disabled,
+// with the reason in the tooltip, instead of failing after the click.
+function blockBtnHtml(r) {
+  const ip = escapeHtml(r.client_ip);
+  if (r.is_blocked) {
+    return `<button class="unblock-btn" data-ip="${ip}" title="Remove this IP from the global blocklist">Unblock</button>`;
+  }
+  const g = r.block_guard || { allowed: true, reason: '' };
+  if (!g.allowed) {
+    return `<button class="block-btn" disabled title="${escapeHtml(g.reason)}">Block</button>`;
+  }
+  return `<button class="block-btn danger" data-ip="${ip}" title="Block this IP across every host, immediately">Block</button>`;
+}
+
+async function onBlockClick(ev) {
+  const block = ev.target.closest('.block-btn:not([disabled])');
+  const unblock = ev.target.closest('.unblock-btn');
+  const btn = block || unblock;
+  if (!btn) return;
+  const ip = btn.dataset.ip;
+  if (block && !confirm(`Block ${ip} on every host?\n\nThis takes effect immediately and applies to all 50+ hostnames.`)) return;
+  btn.disabled = true;
+  const was = btn.textContent;
+  btn.textContent = block ? 'Blocking…' : 'Unblocking…';
+  try {
+    if (block) await api('POST', '/activity/blocklist', { ip, note: 'blocked from breach view' });
+    else await api('DELETE', `/activity/blocklist/${encodeURIComponent(ip)}`);
+    showError('');
+    await loadBreach();
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = was;
+    btn.disabled = false;
+  }
+}
+
+// Only ALERT and WATCH rows offer detail. NOISE and QUIET rows are, by
+// definition, sources that were served nothing worth inspecting — offering a
+// drill-down on all 25 rows would bury the two that matter.
+// Offered wherever there is something worth handing on: a stored assessment, or
+// a row serious enough to have endpoint detail behind it.
+function copyBtnHtml(r) {
+  const lvl = r.verdict && r.verdict.level;
+  if (!r.explanation && lvl !== 'alert' && lvl !== 'watch') return '';
+  return `<button class="copy-btn" data-ip="${escapeHtml(r.client_ip)}"`
+    + ` title="Copy a paste-ready summary: identity, verdict, counts, the AI assessment and the endpoints reached. Credential values are redacted.">Copy</button>`;
+}
+
+async function onCopyClick(ev) {
+  const btn = ev.target.closest('.copy-btn');
+  if (!btn) return;
+  const ip = btn.dataset.ip;
+  const was = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Copying…';
+  try {
+    const hours = $('#breach-window').value;
+    const r = await api('GET', `/activity/breach/handoff?ip=${encodeURIComponent(ip)}&hours=${Number(hours)}`);
+    // Reuses the app's existing helper, which falls back to execCommand — this
+    // page is served over plain HTTP, so navigator.clipboard is unavailable.
+    const ok = await copyToClipboard(r.text);
+    btn.textContent = ok ? 'Copied' : 'Copy failed';
+    if (!ok) showError('Could not reach the clipboard. Select the text manually from the Details panel.');
+    setTimeout(() => { btn.textContent = was; }, 2000);
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = was;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function detailBtnHtml(r) {
+  const lvl = r.verdict && r.verdict.level;
+  if (lvl !== 'alert' && lvl !== 'watch') return '';
+  return `<button class="detail-btn" data-ip="${escapeHtml(r.client_ip)}" aria-expanded="false"`
+    + ` title="Show which endpoints this source actually reached">Details</button>`;
+}
+
+const CONF_TAG = {
+  real: ['real', 'Body was unique to the request — content was genuinely served'],
+  refused: ['refused', 'The server turned this request away (401/403/429)'],
+  'not-found': ['not found', 'No such resource (404 and similar)'],
+  error: ['error', 'The server failed on this request (5xx)'],
+  'likely-blocked': ['blocked', 'Byte-identical to the parked block page — refused'],
+  'likely-shell': ['shell', 'Byte-identical to the catch-all page — nothing served'],
+  unknown: ['unknown', 'No size recorded — cannot tell'],
+};
+
+function pathsTableHtml(paths) {
+  if (!paths.length) return '<p class="muted">No requests recorded for this source in the window.</p>';
+  return '<table class="tbl paths-tbl"><thead><tr>'
+    + '<th>Result</th><th>Status</th><th>Bytes</th><th>Count</th><th>Endpoint</th><th>Last seen</th>'
+    + '</tr></thead><tbody>'
+    + paths.map((p) => {
+      const [tag, help] = CONF_TAG[p.confidence] || CONF_TAG.unknown;
+      return `<tr><td><span class="cf cf-${p.confidence}" title="${escapeHtml(help)}">${tag}</span></td>`
+        + `<td>${p.status}</td><td>${bytesH(p.bytes)}</td><td>${p.count}</td>`
+        + `<td class="pth"><span class="muted">${escapeHtml(p.host)}</span>`
+        + `${escapeHtml(p.method || '')} ${escapeHtml(p.uri)}</td>`
+        + `<td class="muted">${tsH(p.last_ts)}</td></tr>`;
+    }).join('')
+    + '</tbody></table>';
+}
+
+async function onDetailClick(ev) {
+  const btn = ev.target.closest('.detail-btn');
+  if (!btn) return;
+  const ip = btn.dataset.ip;
+  const row = $(`#dt-${slotId(ip)}`);
+  if (!row) return;
+  // The three rows of a group (summary, explanation, detail) share one bottom
+  // rule: whichever is last on screen carries it, so an expanded detail does
+  // not leave a line stranded in the middle of a record.
+  const explainRow = row.previousElementSibling;
+  const summaryRow = explainRow && explainRow.previousElementSibling;
+  const setOpen = (open) => {
+    for (const el of [summaryRow, explainRow]) if (el) el.classList.toggle('has-detail', open);
+  };
+  if (!row.hidden) {
+    row.hidden = true;
+    setOpen(false);
+    btn.setAttribute('aria-expanded', 'false');
+    btn.textContent = 'Details';
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = 'Loading…';
+  try {
+    const hours = $('#breach-window').value;
+    const r = await api('GET', `/activity/breach/paths?ip=${encodeURIComponent(ip)}&hours=${Number(hours)}`);
+    row.firstElementChild.innerHTML = pathsTableHtml(r.paths || []);
+    row.hidden = false;
+    setOpen(true);
+    btn.setAttribute('aria-expanded', 'true');
+    btn.textContent = 'Hide';
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = 'Details';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function slotId(ip) { return String(ip).replace(/[^a-zA-Z0-9]/g, '_'); }
+
+// Escape FIRST, then promote **bold** — models emit markdown even when asked
+// not to, and literal asterisks in the output look like a bug.
+function lightMarkdown(escaped) {
+  return escaped.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function explainHtml(ex) {
+  const when = ex.created_at ? new Date(ex.created_at).toLocaleString() : '';
+  return `<div class="explain-out">${lightMarkdown(escapeHtml(ex.text))}`
+    + `<span class="muted">${escapeHtml(ex.model || '')}${when ? ` · ${escapeHtml(when)}` : ''}</span></div>`;
+}
+
+async function onExplainClick(ev) {
+  const btn = ev.target.closest('.explain-btn');
+  if (!btn) return;
+  const ip = btn.dataset.ip;
+  const slot = $(`#ex-${slotId(ip)}`);
+  const was = btn.textContent;
+  // Pressing a button labelled "Explain again" must actually ask again rather
+  // than hand back the stored answer.
+  const force = /again/i.test(was);
+  btn.disabled = true;
+  btn.textContent = 'Asking…';
+  try {
+    const hours = $('#breach-window').value;
+    const r = await api('POST', '/activity/breach/explain', { ip, hours: Number(hours), force });
+    if (slot) slot.innerHTML = explainHtml({ text: r.text, model: r.model, created_at: Date.now() });
+    btn.textContent = 'Explain again';
+  } catch (e) {
+    if (slot) slot.innerHTML = `<div class="explain-out err">${escapeHtml(e.message)}</div>`;
+    btn.textContent = was;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function loadBreach() {
+  showError('');
+  const hours = $('#breach-window').value;
+  $('#breach-panels').innerHTML = '<p class="muted">Analysing…</p>';
+  try {
+    renderBreach(await api('GET', `/activity/breach?hours=${hours}`));
+  } catch (e) {
+    $('#breach-panels').innerHTML = '';
+    showError(`Breach analysis failed: ${e.message}`);
+  }
+}
+
 function showError(msg) {
   const el = $('#error');
   if (!msg) { el.hidden = true; el.textContent = ''; return; }
@@ -479,7 +827,7 @@ function countryLabel(ip) {
 
 function switchView(view) {
   state.view = view;
-  for (const v of ['rules', 'activity', 'blocklist', 'firewall']) {
+  for (const v of ['rules', 'activity', 'blocklist', 'firewall', 'breach']) {
     $(`#view-${v}`).hidden = view !== v;
     $(`#nav-${v}`).classList.toggle('active', view === v);
   }
@@ -487,6 +835,7 @@ function switchView(view) {
   if (view === 'activity') loadActivity();
   if (view === 'blocklist') loadBlocklist();
   if (view === 'firewall') loadFirewall();
+  if (view === 'breach') loadBreach();
 }
 
 async function loadActivity(opts = {}) {
@@ -1549,6 +1898,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#nav-activity').addEventListener('click', () => switchView('activity'));
   $('#nav-blocklist').addEventListener('click', () => switchView('blocklist'));
   $('#nav-firewall').addEventListener('click', () => switchView('firewall'));
+  $('#nav-breach').addEventListener('click', () => switchView('breach'));
+  $('#breach-refresh').addEventListener('click', () => loadBreach());
+  $('#breach-window').addEventListener('change', () => loadBreach());
+  $('#breach-panels').addEventListener('click', onExplainClick);
+  $('#breach-panels').addEventListener('click', onBlockClick);
+  $('#breach-panels').addEventListener('click', onDetailClick);
+  $('#breach-panels').addEventListener('click', onCopyClick);
   $('#activity-refresh').addEventListener('click', loadActivity);
   $('#activity-window').addEventListener('change', loadActivity);
   $('#activity-body').addEventListener('click', onActivityClick);
@@ -1617,6 +1973,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#btn-logout').addEventListener('click', onLogout);
   $('#btn-password').addEventListener('click', openPasswordDialog);
   $('#btn-maintenance').addEventListener('click', openMaintenanceDialog);
+  $('#btn-blockpage').addEventListener('click', onToggleBlockPage);
+  refreshBlockPage();
   $('#maint-cancel').addEventListener('click', () => $('#maintenance-dialog').close());
   $('#maint-start').addEventListener('click', onMaintenanceStart);
   $('#maint-stop').addEventListener('click', onMaintenanceStop);

@@ -284,3 +284,60 @@ test('non-http rule serves both :80 and :443 with no redirect (Synology-compat)'
     assert.equal(anyRedirect, undefined, `${mode}: should NOT emit 308 redirect`);
   }
 });
+
+// ---- parked "domain for sale" block page -----------------------------------
+
+test('blockPage off (default): rejected visitors still get a plain 403', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http', deny_ips: '1.2.3.4' }]);
+  const deny = cfg.apps.http.servers.srv_http.routes.find((r) => r.match && r.match[0].client_ip);
+  const resp = deny.handle.find((h) => h.handler === 'static_response');
+  assert.equal(resp.status_code, 403);
+  assert.equal(resp.body, 'Forbidden\n');
+});
+
+test('blockPage on: rejected visitors get a 200 HTML parked page', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http', deny_ips: '1.2.3.4' }], { blockPage: true });
+  const deny = cfg.apps.http.servers.srv_http.routes.find((r) => r.match && r.match[0].client_ip);
+  const resp = deny.handle.find((h) => h.handler === 'static_response');
+  assert.equal(resp.status_code, 200, 'a parked domain answers 200, not 403');
+  assert.match(resp.headers['Content-Type'][0], /text\/html/);
+  assert.match(resp.body, /available for sale/i);
+});
+
+test('blockPage renders the visited hostname via a Caddy placeholder', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http', deny_ips: '1.2.3.4' }], { blockPage: true });
+  const deny = cfg.apps.http.servers.srv_http.routes.find((r) => r.match && r.match[0].client_ip);
+  const resp = deny.handle.find((h) => h.handler === 'static_response');
+  assert.match(resp.body, /\{http\.request\.host\}/, 'one page body must serve every hostname');
+});
+
+test('blockPage carries no third-party branding and no data-collection form', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http', deny_ips: '1.2.3.4' }], { blockPage: true });
+  const deny = cfg.apps.http.servers.srv_http.routes.find((r) => r.match && r.match[0].client_ip);
+  const body = deny.handle.find((h) => h.handler === 'static_response').body;
+  assert.doesNotMatch(body, /godaddy|trustpilot/i, 'must not impersonate a real company');
+  assert.doesNotMatch(body, /<form|<input/i, 'must not collect visitor details');
+});
+
+test('blockPage does not override an explicit deny_redirect', () => {
+  const cfg = renderConfig(
+    [{ ...baseRule, tls_mode: 'http', deny_ips: '1.2.3.4', deny_redirect: 'https://example.net/gone' }],
+    { blockPage: true },
+  );
+  const deny = cfg.apps.http.servers.srv_http.routes.find((r) => r.match && r.match[0].client_ip);
+  const resp = deny.handle.find((h) => h.handler === 'static_response');
+  assert.equal(resp.status_code, 302);
+  assert.equal(resp.headers.Location[0], 'https://example.net/gone');
+});
+
+test('blockPage also covers the global blocklist route', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http' }], {
+    blockPage: true,
+    globalBlocks: ['9.9.9.9'],
+  });
+  const route = cfg.apps.http.servers.srv_http.routes.find(
+    (r) => r.match && r.match[0].client_ip && !r.match[0].host);
+  const resp = route.handle.find((h) => h.handler === 'static_response');
+  assert.equal(resp.status_code, 200);
+  assert.match(resp.body, /available for sale/i);
+});

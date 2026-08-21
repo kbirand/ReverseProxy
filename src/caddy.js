@@ -61,7 +61,7 @@ function parseIpList(text) {
 //   access_mode 'whitelist' -> reject requests whose client IP is NOT listed
 //
 // Rejected requests get a 302 to deny_redirect if set, otherwise a plain 403.
-function buildAclRoute(rule) {
+function buildAclRoute(rule, blockPage) {
   const ranges = parseIpList(rule.deny_ips);
   if (!ranges.length) return null;
   const whitelist = rule.access_mode === 'whitelist';
@@ -72,12 +72,7 @@ function buildAclRoute(rule) {
         status_code: 302,
         headers: { Location: [redirect] },
       }
-    : {
-        handler: 'static_response',
-        status_code: 403,
-        headers: { 'Content-Type': ['text/plain; charset=utf-8'] },
-        body: 'Forbidden\n',
-      };
+    : denyHandler(blockPage);
   // Whitelist: match host AND NOT(client_ip in list) -> reject the unlisted.
   // Blacklist: match host AND client_ip in list      -> reject the listed.
   const matcher = whitelist
@@ -362,6 +357,121 @@ p.sub{font-size:19px;color:#86868b;margin:0 0 40px;line-height:1.4;font-weight:4
 </html>`;
 }
 
+// A neutral "parked domain" page served to visitors rejected by IP access
+// control. Rationale: a plain 403 advertises that something private lives on
+// this hostname and that the visitor is not on the list. A parked page is the
+// most unremarkable thing a domain can say, so it reveals nothing.
+//
+// The hostname is filled in by Caddy at request time via {http.request.host},
+// so ONE body serves every rule. Deliberately carries no third-party branding
+// and no form: it is a disguise, not a real listing, and it must not
+// impersonate a registrar or collect visitor details.
+function parkedPageHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>{http.request.host}</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;min-height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  background:#f4f5f5;color:#111;-webkit-font-smoothing:antialiased;
+}
+header{background:#fff;border-bottom:1px solid #e6e8e8;padding:18px 24px}
+.mark{display:flex;align-items:center;gap:10px;max-width:1120px;margin:0 auto}
+.mark .glyph{
+  width:26px;height:26px;border-radius:50%;
+  background:#111;flex:0 0 auto;
+  position:relative;
+}
+.mark .glyph::after{
+  content:"";position:absolute;inset:7px 6px 7px 8px;
+  border-radius:50%;border:2px solid #fff;border-right-color:transparent;
+  transform:rotate(-35deg);
+}
+.mark .name{font-weight:700;font-size:17px;letter-spacing:-0.01em}
+.hero{background:#00a4a6;color:#fff;text-align:center;padding:52px 24px 104px}
+.hero h1{
+  margin:0 0 10px;font-size:clamp(28px,6vw,54px);font-weight:700;
+  letter-spacing:-0.02em;line-height:1.1;word-break:break-word;
+}
+.hero p{margin:0;font-size:clamp(15px,2.4vw,21px);font-weight:600;opacity:.97}
+.cards{
+  max-width:1120px;margin:-64px auto 0;padding:0 24px 64px;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;
+}
+.card{
+  background:#fff;border-radius:6px;padding:28px 30px;
+  box-shadow:0 1px 3px rgba(0,0,0,.08),0 8px 24px rgba(0,0,0,.05);
+}
+.card h2{margin:0 0 14px;font-size:19px;font-weight:700;letter-spacing:-0.01em}
+.card p{margin:0 0 12px;font-size:15px;line-height:1.55;color:#4a5252}
+.card p:last-child{margin-bottom:0}
+.muted{color:#7b8484;font-size:13px}
+footer{
+  border-top:1px solid #e6e8e8;background:#fff;
+  padding:20px 24px;text-align:center;color:#7b8484;font-size:12px;
+}
+@media (prefers-color-scheme:dark){
+  body{background:#0f1212;color:#f2f4f4}
+  header,footer{background:#161a1a;border-color:#242929}
+  .mark .glyph{background:#f2f4f4}
+  .mark .glyph::after{border-color:#161a1a;border-right-color:transparent}
+  .card{background:#161a1a;box-shadow:none;border:1px solid #242929}
+  .card p{color:#a8b1b1}
+}
+</style>
+</head>
+<body>
+<header><div class="mark"><span class="glyph"></span><span class="name">Domain Parking</span></div></header>
+<div class="hero">
+  <h1>{http.request.host}</h1>
+  <p>This domain is available for sale!</p>
+</div>
+<div class="cards">
+  <div class="card">
+    <h2>About this domain</h2>
+    <p>{http.request.host} is registered and currently parked. There is no
+       active website associated with this address.</p>
+    <p class="muted">Parked domains are held by their owner and are not
+       serving public content.</p>
+  </div>
+  <div class="card">
+    <h2>Availability</h2>
+    <p>This domain may be available for transfer. Availability, pricing and
+       terms are set by the current registrant.</p>
+    <p class="muted">No enquiry service is configured for this domain.</p>
+  </div>
+</div>
+<footer>This page is served automatically for a parked domain.</footer>
+</body>
+</html>
+`;
+}
+
+// The response handed to a rejected visitor: the parked page when the block
+// page is enabled, otherwise the historical bare 403.
+function denyHandler(blockPage) {
+  if (blockPage) {
+    return {
+      handler: 'static_response',
+      status_code: 200,
+      headers: { 'Content-Type': ['text/html; charset=utf-8'] },
+      body: parkedPageHtml(),
+    };
+  }
+  return {
+    handler: 'static_response',
+    status_code: 403,
+    headers: { 'Content-Type': ['text/plain; charset=utf-8'] },
+    body: 'Forbidden\n',
+  };
+}
+
 function renderConfig(rules, opts = {}) {
   const fallbackUpstream = opts.fallbackUpstream !== undefined
     ? opts.fallbackUpstream : DEFAULT_FALLBACK_UPSTREAM;
@@ -370,6 +480,7 @@ function renderConfig(rules, opts = {}) {
   const dnsProvider = opts.dnsProvider !== undefined ? opts.dnsProvider : DEFAULT_DNS_PROVIDER;
   const acmeEmail = opts.acmeEmail !== undefined ? opts.acmeEmail : DEFAULT_ACME_EMAIL;
   const globalBlocks = parseIpList((opts.globalBlocks || []).join('\n'));
+  const blockPage = !!opts.blockPage;
   const maintenance = opts.maintenance && opts.maintenance.active ? opts.maintenance : null;
   const enabled = rules.filter((r) => r.enabled);
 
@@ -381,14 +492,7 @@ function renderConfig(rules, opts = {}) {
   if (globalBlocks.length) {
     const blockRoute = {
       match: [{ client_ip: { ranges: globalBlocks } }],
-      handle: [
-        {
-          handler: 'static_response',
-          status_code: 403,
-          headers: { 'Content-Type': ['text/plain; charset=utf-8'] },
-          body: 'Forbidden\n',
-        },
-      ],
+      handle: [denyHandler(blockPage)],
       terminal: true,
     };
     httpRoutes.push(blockRoute);
@@ -436,7 +540,7 @@ function renderConfig(rules, opts = {}) {
   // hostname via https:// still get TLS at the edge (CF) regardless.
   for (const rule of enabled) {
     const route = buildRouteForRule(rule, certDir);
-    const aclRoute = buildAclRoute(rule); // null when IP list is empty
+    const aclRoute = buildAclRoute(rule, blockPage); // null when IP list is empty
     // ACL route must precede the proxy route so a rejected IP is stopped
     // before it can be proxied. Non-http rules live on both :80 and :443.
     if (aclRoute) httpRoutes.push(aclRoute);
@@ -607,6 +711,7 @@ module.exports = {
   pushConfig,
   caddyHealthy,
   maintenancePageHtml,
+  parkedPageHtml,
   DEFAULT_FALLBACK_UPSTREAM,
   DEFAULT_CERT_DIR,
   DEFAULT_ACCESS_LOG,
