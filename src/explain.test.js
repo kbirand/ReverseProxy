@@ -138,3 +138,82 @@ test('many stored explanations can be fetched at once for the summary table', ()
 test('missing explanation returns null, not a throw', () => {
   assert.equal(db.getExplanation(db.open(':memory:'), '9.9.9.9', 24), null);
 });
+
+// ---- resilience -------------------------------------------------------------
+// Kie's /claude/v1/messages route returned 500 for every request, on a trivial
+// prompt, across both models — an upstream outage, not a rejected request.
+// Retry handles the transient case; the fallback model covers a fault specific
+// to one model; and when neither works the error must say so plainly, or the
+// next person assumes the feature is broken and goes looking in the wrong place.
+
+function seqFetch(responses, calls) {
+  let i = 0;
+  return async (url, opts) => {
+    const r = responses[Math.min(i, responses.length - 1)];
+    if (calls) calls.push(JSON.parse(opts.body).model);
+    i += 1;
+    if (r.throw) throw new Error(r.throw);
+    return {
+      ok: r.status === 200, status: r.status,
+      json: async () => r.body || {},
+      text: async () => JSON.stringify(r.body || {}),
+    };
+  };
+}
+const OK = { status: 200, body: { content: [{ type: 'text', text: 'fine' }] } };
+const BOOM = { status: 500, body: { error: { message: 'Server exception' } } };
+
+test('a transient 500 is retried and succeeds', async () => {
+  const calls = [];
+  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
+    apiKey: 'K', retryDelayMs: 0, fetchImpl: seqFetch([BOOM, OK], calls),
+  });
+  assert.equal(out.text, 'fine');
+  assert.equal(calls.length, 2);
+});
+
+test('after retries it falls back to the second model', async () => {
+  const calls = [];
+  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
+    apiKey: 'K', retryDelayMs: 0,
+    fetchImpl: seqFetch([BOOM, BOOM, BOOM, OK], calls),
+  });
+  assert.equal(out.text, 'fine');
+  assert.ok(calls.includes('claude-opus-5'), 'primary tried first');
+  assert.ok(calls.includes('claude-opus-4-8'), 'fallback tried after');
+  assert.equal(out.model, 'claude-opus-4-8');
+});
+
+test('a total outage reports an upstream fault, not a user error', async () => {
+  await assert.rejects(
+    () => explain.askClaude({ ip: '1.2.3.4' }, {
+      apiKey: 'K', retryDelayMs: 0, fetchImpl: seqFetch([BOOM], []),
+    }),
+    (e) => {
+      assert.match(e.message, /unavailable|outage/i);
+      assert.match(e.message, /500/);
+      return true;
+    },
+  );
+});
+
+test('a 401 is NOT retried — a bad key will not fix itself', async () => {
+  const calls = [];
+  await assert.rejects(
+    () => explain.askClaude({ ip: '1.2.3.4' }, {
+      apiKey: 'K', retryDelayMs: 0,
+      fetchImpl: seqFetch([{ status: 401, body: { error: 'bad key' } }], calls),
+    }),
+    /401/,
+  );
+  assert.equal(calls.length, 1, 'exactly one attempt');
+});
+
+test('network failures are retried too', async () => {
+  const calls = [];
+  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
+    apiKey: 'K', retryDelayMs: 0,
+    fetchImpl: seqFetch([{ throw: 'ECONNRESET' }, OK], calls),
+  });
+  assert.equal(out.text, 'fine');
+});

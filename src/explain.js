@@ -14,6 +14,12 @@
 
 const KIE_MESSAGES_URL = 'https://api.kie.ai/claude/v1/messages';
 const DEFAULT_MODEL = 'claude-opus-5';
+// Tried in order. The fallback covers a fault specific to one model; it does
+// not help when the whole /claude/v1/messages route is down, which is what an
+// outage looks like — every model 500s on a trivial prompt.
+const FALLBACK_MODEL = 'claude-opus-4-8';
+const ATTEMPTS_PER_MODEL = 2;
+const RETRY_DELAY_MS = 1500;
 const MAX_SAMPLE_PATHS = 40;
 const MAX_PATH_LEN = 120;
 
@@ -82,35 +88,72 @@ const SYSTEM_PROMPT = [
   'genuinely ambiguous, say so plainly rather than inventing a story.',
 ].join('\n');
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 5xx and network faults are worth retrying; 4xx is not. A bad key, a bad
+// request or a rejected payload will fail identically no matter how many times
+// it is sent, and retrying only makes the user wait longer for the same answer.
+function isRetryable(status) {
+  return status === 0 || status === 429 || (status >= 500 && status < 600);
+}
+
+async function callOnce(model, payload, apiKey, fetchImpl) {
+  let res;
+  try {
+    res = await fetchImpl(KIE_MESSAGES_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        max_tokens: 400,
+        stream: false,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: `Assess this traffic source:\n\n${JSON.stringify(payload, null, 2)}` }],
+      }),
+    });
+  } catch (e) {
+    return { ok: false, status: 0, detail: e.message };
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    return { ok: false, status: res.status, detail: String(body).slice(0, 200) };
+  }
+  const data = await res.json();
+  const text = Array.isArray(data.content)
+    ? data.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n').trim()
+    : '';
+  if (!text) return { ok: false, status: res.status, detail: `no text: ${JSON.stringify(data).slice(0, 200)}` };
+  return { ok: true, text, usage: data.usage || null };
+}
+
 async function askClaude(payload, opts = {}) {
   const apiKey = opts.apiKey;
   if (!apiKey) throw new Error('KIE_API_KEY is not configured — set it before using Explain.');
   const fetchImpl = opts.fetchImpl || globalThis.fetch;
-  const model = opts.model || DEFAULT_MODEL;
+  const delay = opts.retryDelayMs === undefined ? RETRY_DELAY_MS : opts.retryDelayMs;
+  const models = opts.model ? [opts.model] : [DEFAULT_MODEL, FALLBACK_MODEL];
 
-  const res = await fetchImpl(KIE_MESSAGES_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      max_tokens: 400,
-      stream: false,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: `Assess this traffic source:\n\n${JSON.stringify(payload, null, 2)}` }],
-    }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Kie request failed (${res.status}): ${String(body).slice(0, 200)}`);
+  let last = null;
+  for (const model of models) {
+    for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt += 1) {
+      const r = await callOnce(model, payload, apiKey, fetchImpl);
+      if (r.ok) return { text: r.text, model, usage: r.usage };
+      last = { ...r, model };
+      if (!isRetryable(r.status)) {
+        throw new Error(`Kie rejected the request (${r.status}): ${r.detail}`);
+      }
+      if (attempt < ATTEMPTS_PER_MODEL) await sleep(delay);
+    }
   }
-  const data = await res.json();
-  // Anthropic messages shape: content is an array of blocks.
-  const text = Array.isArray(data.content)
-    ? data.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n').trim()
-    : '';
-  if (!text) throw new Error(`Kie returned no text: ${JSON.stringify(data).slice(0, 200)}`);
-  return { text, model, usage: data.usage || null };
+  throw new Error(
+    `Kie's Claude endpoint is unavailable — ${last.status} after `
+    + `${ATTEMPTS_PER_MODEL} attempts on each of ${models.join(' and ')}. `
+    + `This is an upstream outage at Kie, not a problem with your request or your data. `
+    + `Detail: ${last.detail}`,
+  );
 }
 
-module.exports = { buildPayload, redactPath, askClaude, SYSTEM_PROMPT, KIE_MESSAGES_URL, DEFAULT_MODEL };
+module.exports = {
+  buildPayload, redactPath, askClaude, isRetryable,
+  SYSTEM_PROMPT, KIE_MESSAGES_URL, DEFAULT_MODEL, FALLBACK_MODEL,
+};
