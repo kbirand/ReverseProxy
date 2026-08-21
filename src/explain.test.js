@@ -172,16 +172,15 @@ test('a transient 500 is retried and succeeds', async () => {
   assert.equal(calls.length, 2);
 });
 
-test('after retries it falls back to the second model', async () => {
-  const calls = [];
-  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
-    apiKey: 'K', retryDelayMs: 0,
-    fetchImpl: seqFetch([BOOM, BOOM, BOOM, OK], calls),
-  });
-  assert.equal(out.text, 'fine');
-  assert.ok(calls.includes('claude-opus-5'), 'primary tried first');
-  assert.ok(calls.includes('claude-opus-4-8'), 'fallback tried after');
-  assert.equal(out.model, 'claude-opus-4-8');
+test('one dead provider is not survivable by retrying alone', () => {
+  // Superseded design, kept as a reminder of why: the original fallback was
+  // model-level (opus-5 then opus-4-8) on a single vendor. Kie's outage took
+  // out every model on that one route at once — the same trivial prompt failed
+  // on both — so switching model achieved nothing. Fallback has to cross
+  // vendors, which is what PROVIDERS encodes.
+  assert.equal(explain.PROVIDERS.length, 2);
+  const hosts = explain.PROVIDERS.map((p) => new URL(p.url).host);
+  assert.equal(new Set(hosts).size, 2, 'the two providers must be different vendors');
 });
 
 test('a total outage reports an upstream fault, not a user error', async () => {
@@ -216,4 +215,87 @@ test('network failures are retried too', async () => {
     fetchImpl: seqFetch([{ throw: 'ECONNRESET' }, OK], calls),
   });
   assert.equal(out.text, 'fine');
+});
+
+// ---- provider chain ---------------------------------------------------------
+// WaveSpeed first (OpenAI-compatible), Kie second (Anthropic messages shape).
+// Two providers rather than two models: Kie's outage took out every model on
+// one route at once, which a model-level fallback cannot survive. The response
+// shapes differ, so each provider needs its own parser.
+
+function providerFetch(byHost, calls) {
+  return async (url, opts) => {
+    const host = new URL(url).host;
+    if (calls) calls.push(host);
+    const r = byHost[host] || { status: 500, body: {} };
+    if (r.throw) throw new Error(r.throw);
+    return {
+      ok: r.status === 200, status: r.status,
+      json: async () => r.body || {},
+      text: async () => JSON.stringify(r.body || {}),
+    };
+  };
+}
+const WS_OK = { status: 200, body: { model: 'anthropic/claude-opus-5',
+  choices: [{ message: { role: 'assistant', content: 'wavespeed answered' } }],
+  usage: { total_tokens: 20 } } };
+const KIE_OK = { status: 200, body: { content: [{ type: 'text', text: 'kie answered' }] } };
+const DOWN = { status: 500, body: { error: { message: 'Server exception' } } };
+const KEYS = { wavespeedKey: 'WS', apiKey: 'KIE', retryDelayMs: 0 };
+
+test('WaveSpeed is used first and its OpenAI shape is parsed', async () => {
+  const calls = [];
+  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
+    ...KEYS, fetchImpl: providerFetch({ 'llm.wavespeed.ai': WS_OK, 'api.kie.ai': KIE_OK }, calls),
+  });
+  assert.equal(out.text, 'wavespeed answered');
+  assert.equal(calls[0], 'llm.wavespeed.ai', 'primary provider tried first');
+  assert.ok(!calls.includes('api.kie.ai'), 'fallback not touched when primary works');
+});
+
+test('when WaveSpeed is down it falls through to Kie', async () => {
+  const calls = [];
+  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
+    ...KEYS, fetchImpl: providerFetch({ 'llm.wavespeed.ai': DOWN, 'api.kie.ai': KIE_OK }, calls),
+  });
+  assert.equal(out.text, 'kie answered', "Kie's Anthropic shape is parsed too");
+  assert.ok(calls.includes('llm.wavespeed.ai') && calls.includes('api.kie.ai'));
+});
+
+test('a provider with no key is skipped rather than failing the whole call', async () => {
+  const calls = [];
+  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
+    apiKey: 'KIE', wavespeedKey: '', retryDelayMs: 0,
+    fetchImpl: providerFetch({ 'api.kie.ai': KIE_OK }, calls),
+  });
+  assert.equal(out.text, 'kie answered');
+  assert.ok(!calls.includes('llm.wavespeed.ai'), 'unconfigured provider never called');
+});
+
+test('with no keys at all the error names what to configure', async () => {
+  await assert.rejects(
+    () => explain.askClaude({ ip: '1.2.3.4' }, { apiKey: '', wavespeedKey: '', fetchImpl: providerFetch({}) }),
+    /WAVESPEED_API_KEY|KIE_API_KEY/,
+  );
+});
+
+test('both providers down reports an upstream outage naming both', async () => {
+  await assert.rejects(
+    () => explain.askClaude({ ip: '1.2.3.4' }, {
+      ...KEYS, fetchImpl: providerFetch({ 'llm.wavespeed.ai': DOWN, 'api.kie.ai': DOWN }),
+    }),
+    (e) => {
+      assert.match(e.message, /wavespeed/i);
+      assert.match(e.message, /kie/i);
+      assert.match(e.message, /unavailable|outage/i);
+      return true;
+    },
+  );
+});
+
+test('the model reported back identifies which provider answered', async () => {
+  const out = await explain.askClaude({ ip: '1.2.3.4' }, {
+    ...KEYS, fetchImpl: providerFetch({ 'llm.wavespeed.ai': WS_OK, 'api.kie.ai': KIE_OK }),
+  });
+  assert.match(out.model, /wavespeed/i);
 });

@@ -12,14 +12,42 @@
 // before anything leaves the machine, and headers are never included at all.
 // Tests assert that no `eyJ...` or `token=` can survive; do not relax them.
 
-const KIE_MESSAGES_URL = 'https://api.kie.ai/claude/v1/messages';
-const DEFAULT_MODEL = 'claude-opus-5';
-// Tried in order. The fallback covers a fault specific to one model; it does
-// not help when the whole /claude/v1/messages route is down, which is what an
-// outage looks like — every model 500s on a trivial prompt.
-const FALLBACK_MODEL = 'claude-opus-4-8';
-const ATTEMPTS_PER_MODEL = 2;
+// Two providers, not two models. Kie's outage took out every model on one
+// route simultaneously, which a model-level fallback cannot survive — the same
+// trivial prompt failed on opus-5 and opus-4-8 alike. A second vendor can.
+//
+// WaveSpeed is primary: it is OpenAI-compatible and, on measurement, far
+// cheaper — it does not prepend the ~29k-token cached preamble that made a Kie
+// call cost about 8 cents.
+const PROVIDERS = [
+  {
+    name: 'WaveSpeed',
+    url: 'https://llm.wavespeed.ai/v1/chat/completions',
+    model: 'anthropic/claude-opus-5',
+    shape: 'openai',
+    key: (o) => o.wavespeedKey ?? process.env.WAVESPEED_API_KEY,
+    envVar: 'WAVESPEED_API_KEY',
+  },
+  {
+    name: 'Kie',
+    url: 'https://api.kie.ai/claude/v1/messages',
+    model: 'claude-opus-5',
+    shape: 'anthropic',
+    key: (o) => o.apiKey ?? process.env.KIE_API_KEY,
+    envVar: 'KIE_API_KEY',
+  },
+];
+
+const KIE_MESSAGES_URL = PROVIDERS[1].url;
+const DEFAULT_MODEL = PROVIDERS[0].model;
+// Claude Opus 5 has adaptive thinking on: reasoning tokens are drawn from the
+// same max_tokens budget as the answer. At 400 a live call spent 320 on
+// reasoning and the visible answer was cut off mid-sentence. The prompt still
+// asks for ~120 words; this ceiling just has to leave room for the thinking.
+const MAX_TOKENS = 1500;
+const ATTEMPTS_PER_PROVIDER = 2;
 const RETRY_DELAY_MS = 1500;
+
 const MAX_SAMPLE_PATHS = 40;
 const MAX_PATH_LEN = 120;
 
@@ -90,26 +118,52 @@ const SYSTEM_PROMPT = [
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 5xx and network faults are worth retrying; 4xx is not. A bad key, a bad
-// request or a rejected payload will fail identically no matter how many times
-// it is sent, and retrying only makes the user wait longer for the same answer.
+// 5xx, 429 and network faults are worth retrying; 4xx is not. A bad key or a
+// malformed request fails identically however many times it is sent.
 function isRetryable(status) {
   return status === 0 || status === 429 || (status >= 500 && status < 600);
 }
 
-async function callOnce(model, payload, apiKey, fetchImpl) {
+// The two providers speak different dialects: OpenAI puts the answer in
+// choices[0].message.content, Anthropic in a content[] block array.
+function buildBody(provider, payload) {
+  const userText = `Assess this traffic source:\n\n${JSON.stringify(payload, null, 2)}`;
+  if (provider.shape === 'openai') {
+    return {
+      model: provider.model,
+      max_tokens: MAX_TOKENS,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userText },
+      ],
+    };
+  }
+  return {
+    model: provider.model,
+    max_tokens: MAX_TOKENS,
+    stream: false,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: userText }],
+  };
+}
+
+function extractText(provider, data) {
+  if (provider.shape === 'openai') {
+    const c = data && data.choices && data.choices[0];
+    return ((c && c.message && c.message.content) || '').trim();
+  }
+  return Array.isArray(data.content)
+    ? data.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n').trim()
+    : '';
+}
+
+async function callOnce(provider, apiKey, payload, fetchImpl) {
   let res;
   try {
-    res = await fetchImpl(KIE_MESSAGES_URL, {
+    res = await fetchImpl(provider.url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        max_tokens: 400,
-        stream: false,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: `Assess this traffic source:\n\n${JSON.stringify(payload, null, 2)}` }],
-      }),
+      body: JSON.stringify(buildBody(provider, payload)),
     });
   } catch (e) {
     return { ok: false, status: 0, detail: e.message };
@@ -119,41 +173,43 @@ async function callOnce(model, payload, apiKey, fetchImpl) {
     return { ok: false, status: res.status, detail: String(body).slice(0, 200) };
   }
   const data = await res.json();
-  const text = Array.isArray(data.content)
-    ? data.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n').trim()
-    : '';
+  const text = extractText(provider, data);
   if (!text) return { ok: false, status: res.status, detail: `no text: ${JSON.stringify(data).slice(0, 200)}` };
   return { ok: true, text, usage: data.usage || null };
 }
 
 async function askClaude(payload, opts = {}) {
-  const apiKey = opts.apiKey;
-  if (!apiKey) throw new Error('KIE_API_KEY is not configured — set it before using Explain.');
   const fetchImpl = opts.fetchImpl || globalThis.fetch;
   const delay = opts.retryDelayMs === undefined ? RETRY_DELAY_MS : opts.retryDelayMs;
-  const models = opts.model ? [opts.model] : [DEFAULT_MODEL, FALLBACK_MODEL];
+  const configured = PROVIDERS.filter((p) => (p.key(opts) || '').trim());
+  if (!configured.length) {
+    throw new Error(`No LLM provider configured — set ${PROVIDERS.map((p) => p.envVar).join(' or ')}.`);
+  }
 
-  let last = null;
-  for (const model of models) {
-    for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt += 1) {
-      const r = await callOnce(model, payload, apiKey, fetchImpl);
-      if (r.ok) return { text: r.text, model, usage: r.usage };
-      last = { ...r, model };
+  const failures = [];
+  for (const provider of configured) {
+    const apiKey = provider.key(opts).trim();
+    for (let attempt = 1; attempt <= ATTEMPTS_PER_PROVIDER; attempt += 1) {
+      const r = await callOnce(provider, apiKey, payload, fetchImpl);
+      if (r.ok) return { text: r.text, model: `${provider.model} (${provider.name})`, usage: r.usage };
       if (!isRetryable(r.status)) {
-        throw new Error(`Kie rejected the request (${r.status}): ${r.detail}`);
+        // A rejected request will be rejected the same way by a retry, but the
+        // OTHER provider may still work — so record and move on rather than
+        // throwing out of the whole chain.
+        failures.push(`${provider.name} ${r.status}: ${r.detail}`);
+        break;
       }
-      if (attempt < ATTEMPTS_PER_MODEL) await sleep(delay);
+      if (attempt === ATTEMPTS_PER_PROVIDER) failures.push(`${provider.name} ${r.status}: ${r.detail}`);
+      else await sleep(delay);
     }
   }
   throw new Error(
-    `Kie's Claude endpoint is unavailable — ${last.status} after `
-    + `${ATTEMPTS_PER_MODEL} attempts on each of ${models.join(' and ')}. `
-    + `This is an upstream outage at Kie, not a problem with your request or your data. `
-    + `Detail: ${last.detail}`,
+    `Every LLM provider is unavailable — ${failures.join(' | ')}. `
+    + `This is an upstream outage, not a problem with your request or your data.`,
   );
 }
 
 module.exports = {
-  buildPayload, redactPath, askClaude, isRetryable,
-  SYSTEM_PROMPT, KIE_MESSAGES_URL, DEFAULT_MODEL, FALLBACK_MODEL,
+  buildPayload, redactPath, askClaude, isRetryable, buildBody, extractText,
+  SYSTEM_PROMPT, KIE_MESSAGES_URL, DEFAULT_MODEL, PROVIDERS,
 };
