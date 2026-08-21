@@ -97,7 +97,11 @@ function startBreachWatcher(database) {
   }
   const server = process.env.NTFY_SERVER || notify.DEFAULT_SERVER;
   const every = Math.max(30, Number(process.env.BREACH_WATCH_SECONDS) || 60) * 1000;
-  console.log(`[rproxy-ui] breach alerts on: ${server}/${topic.slice(0, 4)}… every ${every / 1000}s`);
+  // Which verdicts page you. Defaults to both; set NTFY_LEVELS=alert to go back
+  // to breaches only. notify.js ignores anything outside its own allowlist.
+  const levels = (process.env.NTFY_LEVELS || notify.NOTIFIABLE.join(','))
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  console.log(`[rproxy-ui] breach alerts on: ${server}/${topic.slice(0, 4)}… every ${every / 1000}s, levels: ${levels.join('+')}`);
 
   const tick = async () => {
     try {
@@ -113,6 +117,7 @@ function startBreachWatcher(database) {
       const sent = await notify.runOnce(database, rows, {
         server,
         topic,
+        levels,
         token: process.env.NTFY_TOKEN || '',
         onError: (ip, reason) => console.error(`[rproxy-ui] breach alert for ${ip} failed: ${reason}`),
       });

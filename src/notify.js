@@ -10,13 +10,34 @@
 // volume, and stops there. Notifications travel through a third party and end
 // up on a lock screen.
 
-const COOLDOWN_MS = 6 * 60 * 60 * 1000; // one buzz per source per 6h
+const COOLDOWN_MS = 6 * 60 * 60 * 1000; // one buzz per source per level per 6h
 const DEFAULT_SERVER = 'https://ntfy.sh';
 
-function shouldNotify(db, row) {
-  if (!row || !row.verdict || row.verdict.level !== 'alert') return false;
+// Only these verdicts are ever worth a notification. NOISE and QUIET are, by
+// definition, sources that were served nothing worth waking anyone for, and
+// YOURS/INTERNAL are you. Overridable via NTFY_LEVELS.
+const NOTIFIABLE = ['alert', 'watch'];
+
+// ALERT breaks Do Not Disturb; WATCH deliberately does not. Measured before
+// enabling WATCH: 4 sources in 72h, and all four were "refused N times" — a
+// scanner bouncing off a locked door is not worth a 3am buzz, but is worth
+// seeing in the morning.
+const LEVEL_STYLE = {
+  alert: { priority: 5, tags: 'rotating_light', title: 'Breach alert' },
+  watch: { priority: 3, tags: 'warning', title: 'Worth a look' },
+};
+
+function shouldNotify(db, row, opts = {}) {
+  const level = row && row.verdict && row.verdict.level;
+  if (!level) return false;
+  const enabled = opts.levels || NOTIFIABLE;
+  // A level outside NOTIFIABLE can never be enabled, even if someone puts it in
+  // NTFY_LEVELS — paging on QUIET would drown the channel that matters.
+  if (!NOTIFIABLE.includes(level) || !enabled.includes(level)) return false;
+  // The cooldown is per level, so a source that escalates from watch to alert
+  // still gets through its own watch cooldown.
   const prior = db.prepare('SELECT sent_at FROM notifications WHERE ip = ? AND kind = ?')
-    .get(row.client_ip, 'alert');
+    .get(row.client_ip, level);
   if (!prior) return true;
   return Date.now() - prior.sent_at > COOLDOWN_MS;
 }
@@ -35,8 +56,9 @@ function mb(n) {
 
 function buildMessage(row) {
   const who = row.label ? ` (${row.label})` : '';
+  const style = LEVEL_STYLE[row.verdict.level] || LEVEL_STYLE.alert;
   return {
-    title: `Breach alert: ${row.client_ip}`,
+    title: `${style.title}: ${row.client_ip}`,
     body: [
       row.verdict.text,
       '',
@@ -45,8 +67,8 @@ function buildMessage(row) {
       `Volume: ${row.requests} requests · ${mb(row.bytes)}`,
       `Served: real ${row.real} · refused ${row.failures}`,
     ].join('\n'),
-    priority: 5,          // max: breaks through Do Not Disturb
-    tags: 'rotating_light',
+    priority: style.priority,
+    tags: style.tags,
   };
 }
 
@@ -81,10 +103,10 @@ async function send(msg, opts = {}) {
 async function runOnce(db, rows, opts = {}) {
   const sent = [];
   for (const row of rows || []) {
-    if (!shouldNotify(db, row)) continue;
+    if (!shouldNotify(db, row, opts)) continue;
     const res = await send(buildMessage(row), opts);
     if (res.sent) {
-      recordNotified(db, row.client_ip, 'alert');
+      recordNotified(db, row.client_ip, row.verdict.level);
       sent.push(row.client_ip);
     } else if (opts.onError) {
       opts.onError(row.client_ip, res.reason);
@@ -93,4 +115,7 @@ async function runOnce(db, rows, opts = {}) {
   return sent;
 }
 
-module.exports = { shouldNotify, recordNotified, buildMessage, send, runOnce, COOLDOWN_MS, DEFAULT_SERVER };
+module.exports = {
+  shouldNotify, recordNotified, buildMessage, send, runOnce,
+  COOLDOWN_MS, DEFAULT_SERVER, NOTIFIABLE, LEVEL_STYLE,
+};

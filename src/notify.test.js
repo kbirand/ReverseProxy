@@ -11,11 +11,15 @@ const ALERT = {
 };
 const NOISE = { ...ALERT, client_ip: '8.8.8.8', real_sensitive: 0, verdict: { level: 'noise', text: 'Automated scan.' } };
 
-test('only ALERT sources are worth waking someone for', () => {
+test('only ALERT and WATCH are worth a notification', () => {
+  // Originally ALERT alone. WATCH was added after measuring the real rate —
+  // 4 sources in 72h — and is sent at a lower priority so it cannot wake
+  // anyone. NOISE and QUIET remain permanently excluded: paging on those would
+  // drown the channel that matters.
   const d = db.open(':memory:');
   assert.equal(notify.shouldNotify(d, ALERT), true);
   assert.equal(notify.shouldNotify(d, NOISE), false);
-  assert.equal(notify.shouldNotify(d, { ...ALERT, verdict: { level: 'watch', text: 'x' } }), false);
+  assert.deepEqual(notify.NOTIFIABLE, ['alert', 'watch']);
 });
 
 test('the same source does not notify twice inside the cooldown', () => {
@@ -82,4 +86,58 @@ test('a source is only recorded as notified when the send actually succeeded', a
   assert.equal(notify.shouldNotify(d, ALERT), true, 'a failed send must not suppress the next attempt');
   await notify.runOnce(d, [ALERT], { server: 'https://ntfy.sh', topic: 't', fetchImpl: fakeFetch({}) });
   assert.equal(notify.shouldNotify(d, ALERT), false);
+});
+
+// ---- WATCH notifications ----------------------------------------------------
+// Measured before enabling: 4 WATCH sources in 72h, about one a day — low
+// enough not to cause fatigue. But all four were "refused N times", the least
+// urgent kind, so WATCH must not break Do Not Disturb the way ALERT does.
+
+const WATCH = {
+  ...ALERT, client_ip: '198.51.100.50', real_sensitive: 0,
+  verdict: { level: 'watch', text: 'Refused 62 times, and nothing sensitive was served.' },
+};
+
+test('WATCH sources notify when enabled', () => {
+  const d = db.open(':memory:');
+  assert.equal(notify.shouldNotify(d, WATCH, { levels: ['alert', 'watch'] }), true);
+});
+
+test('WATCH is ignored when only ALERT is enabled', () => {
+  const d = db.open(':memory:');
+  assert.equal(notify.shouldNotify(d, WATCH, { levels: ['alert'] }), false);
+  assert.equal(notify.shouldNotify(d, ALERT, { levels: ['alert'] }), true);
+});
+
+test('ALERT breaks Do Not Disturb, WATCH does not', () => {
+  assert.ok(notify.buildMessage(ALERT).priority >= 5, 'a breach must cut through silent mode');
+  const w = notify.buildMessage(WATCH);
+  assert.ok(w.priority < 5, 'a scanner being refused must not wake anyone at 3am');
+  assert.ok(w.priority >= 2);
+});
+
+test('the two levels are visibly different on the lock screen', () => {
+  const a = notify.buildMessage(ALERT), w = notify.buildMessage(WATCH);
+  assert.notEqual(a.title, w.title);
+  assert.notEqual(a.tags, w.tags);
+  assert.match(w.title, /198\.51\.100\.50/);
+});
+
+test('escalation from WATCH to ALERT still notifies despite the cooldown', () => {
+  const d = db.open(':memory:');
+  const opts = { levels: ['alert', 'watch'] };
+  notify.recordNotified(d, WATCH.client_ip, 'watch');
+  assert.equal(notify.shouldNotify(d, WATCH, opts), false, 'same level is suppressed');
+  const escalated = { ...WATCH, verdict: { level: 'alert', text: 'now serious' }, real_sensitive: 3 };
+  assert.equal(notify.shouldNotify(d, escalated, opts), true,
+    'a source that gets worse must break through its own cooldown');
+});
+
+test('QUIET and NOISE never notify, whatever is enabled', () => {
+  const d = db.open(':memory:');
+  for (const lvl of ['noise', 'quiet', 'yours', 'internal']) {
+    const row = { ...ALERT, verdict: { level: lvl, text: 'x' } };
+    assert.equal(notify.shouldNotify(d, row, { levels: ['alert', 'watch', lvl] }), false,
+      `${lvl} must never page anyone`);
+  }
 });

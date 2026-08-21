@@ -278,6 +278,72 @@ function bytesH(n) {
 }
 const tsH = (ms) => new Date(ms).toLocaleString();
 
+// Which verdicts are visible. Module-level so it survives a refresh of the
+// panel — losing your filter every 30 seconds would make it useless.
+const VERDICT_ORDER = ['alert', 'watch', 'noise', 'quiet', 'yours', 'internal'];
+const visibleVerdicts = new Set(VERDICT_ORDER);
+
+function filterBarHtml(rows) {
+  const counts = {};
+  for (const r of rows) {
+    const l = r.verdict && r.verdict.level;
+    if (l) counts[l] = (counts[l] || 0) + 1;
+  }
+  const chips = VERDICT_ORDER.filter((l) => counts[l]).map((l) => {
+    const [lab, help] = VERDICT_LABEL[l] || [l, ''];
+    const on = visibleVerdicts.has(l);
+    return `<button class="vfilter vf-${l}${on ? '' : ' off'}" data-verdict="${l}"`
+      + ` aria-pressed="${on}" title="${escapeHtml(help)}">`
+      + `<span class="vf-dot"></span>${lab}<span class="vf-n">${counts[l]}</span></button>`;
+  }).join('');
+  if (!chips) return '';
+  return `<div class="vfilters"><span class="muted">Show</span>${chips}`
+    + `<button class="vfilter vf-all" data-verdict="__all">All</button>`
+    + `<span class="muted vf-count" id="vf-count"></span></div>`;
+}
+
+// Hides whole groups — summary, explanation and detail share a data-verdict.
+function applyVerdictFilter() {
+  const root = $('#breach-panels');
+  if (!root) return;
+  let shown = 0, total = 0;
+  for (const tr of root.querySelectorAll('tr[data-verdict]')) {
+    const on = visibleVerdicts.has(tr.dataset.verdict);
+    if (tr.classList.contains('detail-row')) {
+      // Never un-hide a detail row that was never expanded.
+      if (!on) tr.hidden = true;
+      continue;
+    }
+    tr.style.display = on ? '' : 'none';
+    if (!tr.classList.contains('explain-row')) { total += 1; if (on) shown += 1; }
+  }
+  const c = $('#vf-count');
+  if (c) c.textContent = shown === total ? `${total} sources` : `${shown} of ${total} sources`;
+  for (const b of root.querySelectorAll('.vfilter[data-verdict]')) {
+    const v = b.dataset.verdict;
+    if (v === '__all') continue;
+    const on = visibleVerdicts.has(v);
+    b.classList.toggle('off', !on);
+    b.setAttribute('aria-pressed', String(on));
+  }
+}
+
+function onVerdictFilterClick(ev) {
+  const btn = ev.target.closest('.vfilter');
+  if (!btn) return;
+  const v = btn.dataset.verdict;
+  if (v === '__all') {
+    for (const l of VERDICT_ORDER) visibleVerdicts.add(l);
+  } else if (visibleVerdicts.has(v)) {
+    visibleVerdicts.delete(v);
+    // Turning off the last one shows nothing at all, which reads as a bug.
+    if (!visibleVerdicts.size) for (const l of VERDICT_ORDER) visibleVerdicts.add(l);
+  } else {
+    visibleVerdicts.add(v);
+  }
+  applyVerdictFilter();
+}
+
 function panel(title, subtitle, bodyHtml) {
   return `<section class="breach-panel"><h3>${escapeHtml(title)}</h3>`
        + `<p class="muted">${escapeHtml(subtitle)}</p>${bodyHtml}</section>`;
@@ -291,13 +357,17 @@ function renderBreach(rep) {
   const sum = rep.ip_summary || [];
   out.push(panel('Who was here',
     'Every source in this window, worst first. The verdict is computed from what was actually served — not from how alarming the path looked.',
+    filterBarHtml(sum) +
     sum.length ? '<table class="tbl">'
     + '<colgroup><col class="c-verdict"><col class="c-source"><col class="c-recv"><col class="c-assess"><col class="c-act"></colgroup>'
     + '<thead><tr><th>Verdict</th><th>Source</th><th>Received</th><th>Assessment</th><th></th></tr></thead><tbody>'
     + sum.map((r) => {
       const [lab, help] = VERDICT_LABEL[r.verdict.level] || ['?', ''];
-      return `<tr class="${r.explanation ? 'has-explanation' : ''}">`
-        + `<td><span class="vd vd-${r.verdict.level}" title="${escapeHtml(help)}">${lab}</span></td>`
+      const lv = r.verdict.level;
+      // Every row of a group carries the verdict so the filter hides a source
+      // together with its explanation and its expanded detail.
+      return `<tr class="${r.explanation ? 'has-explanation' : ''}" data-verdict="${lv}">`
+        + `<td><span class="vd vd-${lv}" title="${escapeHtml(help)}">${lab}</span></td>`
         + `<td><code>${escapeHtml(r.client_ip)}</code>${r.label ? `<span class="muted">${escapeHtml(r.label)}</span>` : ''}</td>`
         + `<td>${r.requests} reqs · ${bytesH(r.bytes)}<span class="muted">`
         + `real ${r.real} · blocked ${r.blocked} · shell ${r.shell} · unknown ${r.unknown} · ${r.failures} refused</span></td>`
@@ -314,9 +384,9 @@ function renderBreach(rep) {
         // Explanation, then detail — each in a full-width row of its own.
         // Nesting either inside the Assessment cell stretched that column and
         // knocked every rule out of alignment.
-        + `<tr class="explain-row"><td colspan="5" class="explain-slot" id="ex-${slotId(r.client_ip)}">`
+        + `<tr class="explain-row" data-verdict="${lv}"><td colspan="5" class="explain-slot" id="ex-${slotId(r.client_ip)}">`
         + `${r.explanation ? explainHtml(r.explanation) : ''}</td></tr>`
-        + `<tr class="detail-row" id="dt-${slotId(r.client_ip)}" hidden><td colspan="5"></td></tr>`;
+        + `<tr class="detail-row" data-verdict="${lv}" id="dt-${slotId(r.client_ip)}" hidden><td colspan="5"></td></tr>`;
     }).join('') + '</tbody></table>'
     : '<p class="muted">No traffic in this window.</p>'));
 
@@ -356,6 +426,7 @@ function renderBreach(rep) {
     + '</tbody></table>' : '<p class="muted">None.</p>'));
 
   $('#breach-panels').innerHTML = out.join('');
+  applyVerdictFilter();
   const alerts = sum.filter((r) => r.verdict.level === 'alert').length;
   const watch = sum.filter((r) => r.verdict.level === 'watch').length;
   $('#breach-stats').textContent = alerts
@@ -1905,6 +1976,7 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#breach-panels').addEventListener('click', onBlockClick);
   $('#breach-panels').addEventListener('click', onDetailClick);
   $('#breach-panels').addEventListener('click', onCopyClick);
+  $('#breach-panels').addEventListener('click', onVerdictFilterClick);
   $('#activity-refresh').addEventListener('click', loadActivity);
   $('#activity-window').addEventListener('change', loadActivity);
   $('#activity-body').addEventListener('click', onActivityClick);

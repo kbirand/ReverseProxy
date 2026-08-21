@@ -426,9 +426,35 @@ h4.conf-unknown { color: #8a6d00; }
 h4.conf-likely-blocked { color: #1d7a4c; }
 h4.conf-likely-shell { color: #6b7280; }
 
-.vd { display:inline-block; padding:2px 7px; border-radius:3px; font-size:11px; font-weight:700; letter-spacing:.05em; color:#fff; }
-.vd-alert{background:#b3261e} .vd-watch{background:#b26a00} .vd-noise{background:#6b7280}
-.vd-quiet{background:#8a9199} .vd-yours{background:#1d7a4c} .vd-internal{background:#3f5a8a}
+/* Six verdicts, each needing to be told apart at a glance. The previous noise
+   and quiet greys (#6b7280 / #8a9199) were near-identical — the two most common
+   verdicts were the two hardest to distinguish. Severity now reads as a ramp:
+   red, amber, slate, faint; with your own traffic green and the LAN blue so it
+   is obvious at a glance that those rows are not outsiders. */
+.vd { display:inline-block; min-width:64px; text-align:center; padding:2px 7px;
+  border-radius:3px; font-size:11px; font-weight:700; letter-spacing:.05em; color:#fff; }
+.vd-alert    { background:#c62828; }
+.vd-watch    { background:#e08600; }
+.vd-noise    { background:#546e7a; }
+.vd-quiet    { background:#9aa5ab; }
+.vd-yours    { background:#1d7a4c; }
+.vd-internal { background:#3f5a8a; }
+
+/* Filter chips. Each carries its verdict colour as a dot so the legend and the
+   badges are the same visual language, and a count so an empty bucket is
+   obvious without scrolling. */
+.vfilters { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:0 0 10px; }
+.vfilters > .muted { font-size:12px; margin-right:2px; }
+.vfilter { display:inline-flex; align-items:center; gap:6px; padding:3px 9px;
+  font-size:11px; font-weight:600; letter-spacing:.04em; border-radius:14px; cursor:pointer; }
+.vfilter .vf-dot { width:8px; height:8px; border-radius:50%; background:currentColor; flex:0 0 auto; }
+.vfilter .vf-n { opacity:.65; font-weight:500; }
+.vfilter.off { opacity:.42; }
+.vfilter.off .vf-dot { background:transparent; box-shadow:inset 0 0 0 1.5px currentColor; }
+.vf-alert{color:#c62828} .vf-watch{color:#e08600} .vf-noise{color:#546e7a}
+.vf-quiet{color:#9aa5ab} .vf-yours{color:#1d7a4c} .vf-internal{color:#3f5a8a}
+.vfilter.vf-all { color:inherit; opacity:.8; }
+.vfilters .vf-count { margin-left:auto; font-size:12px; }
 
 .breach-actions button { font-size:12px; padding:3px 8px; white-space:nowrap; flex:0 0 auto; }
 .block-btn[disabled] { opacity:.4; cursor:not-allowed; }
@@ -451,6 +477,6 @@ h4.conf-likely-shell { color: #6b7280; }
 .paths-tbl td.pth { overflow-wrap: anywhere; }
 .paths-tbl td.pth span.muted { display: block; font-size: 11px; }
 .cf { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:700; letter-spacing:.04em; color:#fff; cursor:help; }
-.cf-real{background:#b3261e} .cf-likely-blocked{background:#1d7a4c}
-.cf-likely-shell{background:#6b7280} .cf-unknown{background:#8a6d00}
-.cf-refused{background:#1d7a4c} .cf-not-found{background:#5a6672} .cf-error{background:#8a6d00}
+.cf-real{background:#c62828} .cf-likely-blocked{background:#1d7a4c}
+.cf-likely-shell{background:#546e7a} .cf-unknown{background:#b8860b}
+.cf-refused{background:#2e7d5b} .cf-not-found{background:#9aa5ab} .cf-error{background:#e08600}
