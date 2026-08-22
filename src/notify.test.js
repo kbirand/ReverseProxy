@@ -141,3 +141,71 @@ test('QUIET and NOISE never notify, whatever is enabled', () => {
       `${lvl} must never page anyone`);
   }
 });
+
+// This module opens by promising the message names the IP, the host and the
+// volume and stops there, because notifications cross a third party and land on
+// a lock screen. Endpoints were asked for anyway — you cannot judge "check what
+// was served" without them — so they go in REDACTED and CAPPED: the shape of the
+// request, never the query values that carry credentials or filenames.
+const REAL_ROW = {
+  client_ip: '203.0.113.10',
+  label: 'Example Cloud · US',
+  top_host: 'lab.example.com',
+  requests: 429, bytes: 186_300_000, real: 340, failures: 8,
+  verdict: { level: 'watch', text: '186 MB from lab.example.com.' },
+};
+
+test('served endpoints appear, redacted and capped', () => {
+  const msg = notify.buildMessage(REAL_ROW, {
+    paths: [
+      { uri: '/api/backups/download?file=prod-2026-08.sql.gz&token=abcd', confidence: 'real', bytes: 9_900_000 },
+      { uri: '/api/uploads/082026/19/assets/wf-gen-1787136210669.jpg', confidence: 'real', bytes: 9_100_000 },
+      { uri: '/admin/users', confidence: 'real', bytes: 4_000 },
+      { uri: '/wp-login.php', confidence: 'not-found', bytes: 3_212 },
+      { uri: '/never-shown', confidence: 'real', bytes: 1 },
+    ],
+  });
+  assert.match(msg.body, /\/api\/backups\/download/, 'the endpoint shape is the point');
+  assert.doesNotMatch(msg.body, /prod-2026-08/, 'a filename is not shape, it is content');
+  assert.doesNotMatch(msg.body, /abcd/, 'and a token must never ride a lock screen');
+  assert.doesNotMatch(msg.body, /wp-login/, 'only what was actually SERVED is listed');
+  assert.doesNotMatch(msg.body, /never-shown/, 'capped at three');
+});
+
+test('a message with no path data is unchanged', () => {
+  const msg = notify.buildMessage(REAL_ROW, {});
+  assert.match(msg.body, /Source: 203\.0\.113\.10/);
+  assert.ok(!msg.actions, 'no action without a configured block url');
+});
+
+test('the block button carries the token and posts', () => {
+  const msg = notify.buildMessage(REAL_ROW, { blockUrl: 'https://block.example.com/api/block/TOK123' });
+  assert.match(msg.actions, /^http,/, 'an http action fires without opening a browser');
+  assert.match(msg.actions, /https:\/\/block\.example\.com\/api\/block\/TOK123/);
+  assert.match(msg.actions, /method=POST/, 'GET would let a link preview block an IP');
+  assert.match(msg.actions, /203\.0\.113\.10/, 'the button says which IP it blocks');
+});
+
+test('the action never contains a comma that would split the header', () => {
+  const msg = notify.buildMessage({ ...REAL_ROW, label: 'Big Corp, Inc · US' },
+    { blockUrl: 'https://block.example.com/api/block/TOK123' });
+  const fields = msg.actions.split(',').map((s) => s.trim());
+  assert.equal(fields[0], 'http');
+  assert.ok(fields[2].startsWith('https://'), 'the url must land in the third field');
+});
+
+test('send passes the action through to ntfy', async () => {
+  let seen = null;
+  await notify.send(
+    { title: 't', body: 'b', priority: 3, tags: 'warning', actions: 'http, Block, https://x/y, method=POST' },
+    { topic: 'topic', fetchImpl: async (url, init) => { seen = init; return { ok: true }; } },
+  );
+  assert.equal(seen.headers.Actions, 'http, Block, https://x/y, method=POST');
+});
+
+test('send omits the Actions header entirely when there is none', async () => {
+  let seen = null;
+  await notify.send({ title: 't', body: 'b' },
+    { topic: 'topic', fetchImpl: async (url, init) => { seen = init; return { ok: true }; } });
+  assert.ok(!('Actions' in seen.headers), 'an empty header is not the same as no header');
+});

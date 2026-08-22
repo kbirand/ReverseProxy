@@ -54,10 +54,39 @@ function mb(n) {
   return n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`;
 }
 
-function buildMessage(row) {
+// How many served endpoints ride along, and how much of each. "Check what was
+// served" is unanswerable without them, but they cross ntfy and land on a lock
+// screen, so: only what was actually served, only the path, never the query.
+const MAX_ENDPOINTS = 3;
+const MAX_PATH = 60;
+
+function endpointLines(paths) {
+  if (!Array.isArray(paths) || !paths.length) return [];
+  const served = paths.filter((p) => p && p.confidence === 'real');
+  if (!served.length) return [];
+  const lines = served.slice(0, MAX_ENDPOINTS).map((p) => {
+    // Query values carry credentials and filenames. On a lock screen the query
+    // earns nothing the path does not, so only the path goes.
+    const cut = String(p.uri || '').split(/[?#]/)[0];
+    const short = cut.length > MAX_PATH ? `${cut.slice(0, MAX_PATH - 1)}…` : cut;
+    return `  ${short}`;
+  });
+  const more = served.length - lines.length;
+  if (more > 0) lines.push(`  …and ${more} more`);
+  return ['', 'Reached:', ...lines];
+}
+
+// ntfy splits the Actions header on commas, so no field may contain one. An IP
+// cannot; the label can, which is why the label is not in the button.
+function blockAction(ip, blockUrl) {
+  if (!blockUrl) return null;
+  return `http, Block ${ip}, ${blockUrl}, method=POST, clear=true`;
+}
+
+function buildMessage(row, opts = {}) {
   const who = row.label ? ` (${row.label})` : '';
   const style = LEVEL_STYLE[row.verdict.level] || LEVEL_STYLE.alert;
-  return {
+  const msg = {
     title: `${style.title}: ${row.client_ip}`,
     body: [
       row.verdict.text,
@@ -66,10 +95,14 @@ function buildMessage(row) {
       `Host:   ${row.top_host || 'multiple'}`,
       `Volume: ${row.requests} requests · ${mb(row.bytes)}`,
       `Served: real ${row.real} · refused ${row.failures}`,
+      ...endpointLines(opts.paths),
     ].join('\n'),
     priority: style.priority,
     tags: style.tags,
   };
+  const action = blockAction(row.client_ip, opts.blockUrl);
+  if (action) msg.actions = action;
+  return msg;
 }
 
 // Never throws: this runs inside a timer, and a push outage must not take the
@@ -86,6 +119,7 @@ async function send(msg, opts = {}) {
         Title: msg.title,
         Priority: String(msg.priority || 4),
         Tags: msg.tags || 'warning',
+        ...(msg.actions ? { Actions: msg.actions } : {}),
         ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
       },
       body: msg.body,
@@ -104,7 +138,14 @@ async function runOnce(db, rows, opts = {}) {
   const sent = [];
   for (const row of rows || []) {
     if (!shouldNotify(db, row, opts)) continue;
-    const res = await send(buildMessage(row), opts);
+    // Paths and the block token are resolved per row, and only for rows that
+    // are actually going out — building them for every source would query the
+    // endpoint table hundreds of times a minute for nothing.
+    let paths = [];
+    let blockUrl = '';
+    try { if (opts.pathsFor) paths = opts.pathsFor(row.client_ip) || []; } catch { paths = []; }
+    try { if (opts.blockUrlFor) blockUrl = opts.blockUrlFor(row.client_ip) || ''; } catch { blockUrl = ''; }
+    const res = await send(buildMessage(row, { paths, blockUrl }), opts);
     if (res.sent) {
       recordNotified(db, row.client_ip, row.verdict.level);
       sent.push(row.client_ip);

@@ -384,3 +384,32 @@ test('no fallback upstream means no fallback route at all', () => {
     r.match && r.match[0] && r.match[0].client_ip && r.match[0].host);
   assert.equal(fb, undefined);
 });
+
+// The notification block button is tapped from a phone that is usually not on
+// the LAN, so one path has to be reachable from the internet. Publishing the
+// panel itself would expose a dashboard that can rewrite the firewall, so this
+// route is scoped three ways — one hostname, one path prefix, POST only — and
+// exists at all only when BLOCK_ACTION_HOST names a host.
+test('the block-action route is scoped to one host, one path and POST', () => {
+  const cfg = renderConfig([], {
+    blockActionHost: 'block.example.com',
+    blockActionUpstream: '127.0.0.1:8080',
+  });
+  const servers = cfg.apps.http.servers;
+  const routes = Object.values(servers).flatMap((sv) => sv.routes);
+  assert.ok(servers.srv_https, 'the route must reach :443 — the token must not cross the internet in clear');
+  const hit = routes.filter((r) => JSON.stringify(r).includes('/api/block/'));
+  assert.ok(hit.length > 0, 'the route must exist when a host is configured');
+  for (const r of hit) {
+    const m = r.match[0];
+    assert.deepEqual(m.host, ['block.example.com'], 'exactly one hostname');
+    assert.deepEqual(m.path, ['/api/block/*'], 'exactly one path prefix');
+    assert.deepEqual(m.method, ['POST'], 'POST only — a GET would let a link preview block an IP');
+  }
+});
+
+test('no block-action host means no public route at all', () => {
+  const cfg = renderConfig([], {});
+  const blob = JSON.stringify(cfg);
+  assert.ok(!blob.includes('/api/block/'), 'the endpoint stays private unless deliberately published');
+});

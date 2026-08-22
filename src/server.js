@@ -10,6 +10,8 @@ const notify = require('./notify');
 const rulesRoute = require('./routes/rules');
 const systemRoute = require('./routes/system');
 const activityRoute = require('./routes/activity');
+const blockActionRoute = require('./routes/blockAction');
+const blockToken = require('./blockToken');
 const authRoute = require('./routes/auth');
 const firewallRoute = require('./routes/firewall');
 
@@ -30,6 +32,13 @@ app.use(express.json({ limit: '1mb' }));
 // Auth router is public (its routes self-guard); everything else under /api
 // requires a valid session. Static files stay public — they hold no secrets.
 app.use('/api/auth', authRoute.buildRouter(database));
+// The notification block button. Deliberately mounted BEFORE requireAuth: it is
+// tapped from a phone with no panel session, and its authorisation is a signed
+// single-IP token instead (see routes/blockAction.js). It is published on its
+// own hostname so nothing else under /api is exposed with it.
+app.use('/api/block', blockActionRoute.buildRouter(database, {
+  secret: () => blockToken.secretFor(database),
+}));
 app.use('/api', auth.requireAuth(database));
 // Until the default admin/admin password is changed, block privileged and
 // secret-exposing endpoints (rule/firewall edits, self-update, restore, backup,
@@ -119,6 +128,15 @@ function startBreachWatcher(database) {
         topic,
         levels,
         token: process.env.NTFY_TOKEN || '',
+        // BLOCK_ACTION_HOST is what publishes the endpoint through Caddy. With
+        // no host there is nothing reachable to point a button at, so the button
+        // is absent rather than broken.
+        pathsFor: (ip) => breach.pathsForIp(database, ip, { hours: 1, limit: 8 }),
+        blockUrlFor: (ip) => {
+          const host = (process.env.BLOCK_ACTION_HOST || '').trim();
+          if (!host) return '';
+          return `https://${host}/api/block/${blockToken.mint(ip, { secret: blockToken.secretFor(database) })}`;
+        },
         onError: (ip, reason) => console.error(`[rproxy-ui] breach alert for ${ip} failed: ${reason}`),
       });
       for (const ip of sent) console.warn(`[rproxy-ui] BREACH ALERT sent for ${ip}`);

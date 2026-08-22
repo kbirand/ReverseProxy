@@ -32,6 +32,16 @@ const DEFAULT_FALLBACK_HOSTS = (process.env.FALLBACK_HOSTS
 // the ProxySQL one can fail the database cluster over via sudo — so the route
 // also requires the connection itself to come from loopback. Widen it only
 // deliberately, via FALLBACK_CLIENT_IPS.
+// The single public path for the notification "block this source" button. It is
+// tapped from a phone that is usually not on the LAN, so something has to be
+// reachable from the internet — but publishing the panel would put a dashboard
+// that can rewrite the firewall on the open web. This publishes ONE path prefix,
+// on ONE hostname, POST only, and only when BLOCK_ACTION_HOST names a host.
+// Authorisation is the signed single-IP token in the URL (see blockToken.js).
+const DEFAULT_BLOCK_ACTION_HOST = (process.env.BLOCK_ACTION_HOST || '').trim();
+const DEFAULT_BLOCK_ACTION_UPSTREAM = (process.env.BLOCK_ACTION_UPSTREAM
+  || '127.0.0.1:8080').trim();
+
 const DEFAULT_FALLBACK_CLIENT_IPS = (process.env.FALLBACK_CLIENT_IPS
   || '127.0.0.1/32,::1/128')
   .split(',').map((s) => s.trim()).filter(Boolean);
@@ -569,6 +579,22 @@ function renderConfig(rules, opts = {}) {
   // and those requests get the clean 404 below, same as any unknown host.
   const fallbackHosts = opts.fallbackHosts || DEFAULT_FALLBACK_HOSTS;
   const fallbackClientIps = opts.fallbackClientIps || DEFAULT_FALLBACK_CLIENT_IPS;
+  const blockActionHost = opts.blockActionHost === undefined
+    ? DEFAULT_BLOCK_ACTION_HOST : opts.blockActionHost;
+  const blockActionUpstream = opts.blockActionUpstream || DEFAULT_BLOCK_ACTION_UPSTREAM;
+  if (blockActionHost) {
+    // POST only: a GET here would let any link preview, crawler or chat client
+    // that unfurls the URL block an address without anyone tapping anything.
+    // On :443 as well as :80 — the token is a credential and must not cross the
+    // internet in clear, and the notification action is an https:// URL.
+    const blockActionRoute = {
+      match: [{ host: [blockActionHost], path: ['/api/block/*'], method: ['POST'] }],
+      handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: blockActionUpstream }] }],
+      terminal: true,
+    };
+    httpRoutes.push(blockActionRoute);
+    httpsRoutes.push(blockActionRoute);
+  }
   if (fallbackUpstream && fallbackHosts.length) {
     httpRoutes.push({
       match: [{ host: fallbackHosts, client_ip: { ranges: fallbackClientIps } }],
