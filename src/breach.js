@@ -72,7 +72,10 @@ function gotIn(db, opts = {}) {
     ORDER BY ts DESC
     LIMIT ?
   `).all(from, ...SENSITIVE, opts.limit || 200);
-  return rows.map((r) => ({ ...r, confidence: classify(r, shells, opts.hostsWithAcl) }));
+  // classifyPath, not classify: a 3xx here is a signpost off a sensitive path,
+  // and calling it real content made "got in" mean two different things on two
+  // different screens. The row stays listed; only its label changes.
+  return rows.map((r) => ({ ...r, confidence: classifyPath(r, shells, opts.hostsWithAcl) }));
 }
 
 // Bytes leaving the estate, grouped by who pulled them and from where.
@@ -219,11 +222,31 @@ function verdictFor(r, allowlisted) {
   // Checked BEFORE the refusal rule: an IP that was turned away is the system
   // working. Ranking that above real findings buries them.
   if (r.probes >= 20 || r.distinct_paths >= 20) {
+    const rented = r.is_hosting ? ' Running on rented cloud infrastructure.' : '';
     if (r.real === 0 || r.blocked + r.shell > r.real) {
       return {
         level: 'noise',
         text: `Automated scan — ${r.requests} requests across ${r.distinct_paths} paths, nothing served.`
-            + (r.is_hosting ? ' Running on rented cloud infrastructure.' : ''),
+            + rented,
+      };
+    }
+    // A scan that found something is the only version worth waking up for, and it
+    // was the one that vanished: this block returned ONLY when nothing was served,
+    // so a single hit fell through to the closing 'ordinary traffic' default — a
+    // quiet level, which notify never delivers. 20.196.209.81 walked 223 paths in
+    // 77 seconds, was served 6 real responses, and was reported as ordinary.
+    //
+    // Many distinct paths alone does NOT mean scanning: someone browsing a gallery
+    // touches 60 paths and is answered on every one. What separates the two is
+    // whether the requests were ANSWERED. A scanner is mostly refused (6 of 445
+    // here); a visitor is mostly served (60 of 60). Hits on known probe paths count
+    // too — being answered on those is worse than being refused, not better.
+    const mostlyUnanswered = r.real * 2 < r.requests;
+    if (mostlyUnanswered || r.probes >= 20) {
+      return {
+        level: 'watch',
+        text: `Automated scan — ${r.requests} requests across ${r.distinct_paths} paths, and `
+            + `${r.real} returned real content. Check what was served.` + rented,
       };
     }
   }
@@ -284,7 +307,9 @@ function ipSummary(db, opts = {}) {
   const tally = {};
   for (const b of buckets) {
     const t = (tally[b.client_ip] ||= { real: 0, blocked: 0, shell: 0, unknown: 0, real_sensitive: 0 });
-    const served = b.status >= 200 && b.status < 400;
+    // 2xx only. Under 400 swept in every redirect, so being pointed elsewhere
+    // counted as being served something.
+    const served = b.status >= 200 && b.status < 300;
     const kind = classify(b, shells, acl);
     if (!served) continue;
     t[kind === 'likely-blocked' ? 'blocked' : kind === 'likely-shell' ? 'shell' : kind === 'unknown' ? 'unknown' : 'real'] += b.c;
@@ -344,6 +369,10 @@ function classifyPath(row, shells, acl) {
   if (st >= 500) return 'error';
   if (st === 401 || st === 403 || st === 429) return 'refused';
   if (st >= 400) return 'not-found';
+  // A redirect is a signpost, not a page. classify() weighs body size alone, so a
+  // 302's few hundred bytes read as unique content and counted as a served
+  // response. 168.62.48.100 rode that all the way to a WATCH on one answer.
+  if (st >= 300) return 'redirect';
   return classify(row, shells, acl);
 }
 
@@ -362,7 +391,12 @@ function pathsForIp(db, ip, opts = {}) {
     FROM access_events
     WHERE client_ip = ? AND ts >= ?
     GROUP BY host, uri, method, status, size
-    ORDER BY bytes DESC, count DESC
+      -- Served responses first, THEN size. Ordering by bytes alone hid the only
+      -- row worth reading: 168.62.48.100 was refused on 89 paths at 3212 bytes
+      -- each and served once at less than that, so the served row sorted last and
+      -- the LIMIT dropped it — under a verdict that said "check what was served".
+      -- Truncation may lose refusals; it must never lose evidence.
+      ORDER BY (status < 400) DESC, bytes DESC, count DESC
     LIMIT ?
   `).all(ip, from, opts.limit || 60);
   return rows.map((r) => ({ ...r, confidence: classifyPath(r, shells, acl) }));
@@ -433,7 +467,8 @@ function formatForHandoff({ row, paths = [], explanation = null, hours = 24 }) {
     L.push('result    status  bytes       count  endpoint');
     for (const p of paths) {
       const tag = { real: 'real', 'likely-blocked': 'blocked', 'likely-shell': 'shell',
-        refused: 'refused', 'not-found': 'not-found', error: 'error', unknown: 'unknown' }[p.confidence] || '?';
+        refused: 'refused', 'not-found': 'not-found', error: 'error',
+        redirect: 'redirect', unknown: 'unknown' }[p.confidence] || '?';
       L.push(`${tag.padEnd(9)} ${String(p.status).padEnd(6)} ${fmtBytes(p.bytes).padStart(10)} ${String(p.count).padStart(6)}  ${p.host}${redactQuery(p.uri)}`);
     }
   } else {

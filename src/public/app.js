@@ -266,6 +266,7 @@ const CONF_LABEL = {
   real: ['real', 'Response body is unique to this request — treat as a genuine read'],
   'likely-blocked': ['blocked', 'Byte-identical to this host\'s parked block page — the visitor was refused'],
   'likely-shell': ['shell', 'Byte-identical to this host\'s catch-all page — no data was served'],
+  redirect: ['redirect', 'A 3xx pointing elsewhere — a signpost, not content served'],
   unknown: ['unknown', 'No response size recorded — cannot tell. Do not assume safe'],
 };
 
@@ -396,9 +397,9 @@ function renderBreach(rep) {
     + `<td><code>${escapeHtml(r.client_ip)}</code></td><td>${escapeHtml(r.host)}</td><td class="muted">${tsH(r.last_ts)}</td></tr>`).join('')
     + '</tbody></table>' : '<p class="muted">Nothing recorded in this window.</p>'));
 
-  const groups = { real: [], 'likely-blocked': [], 'likely-shell': [], unknown: [] };
+  const groups = { real: [], redirect: [], 'likely-blocked': [], 'likely-shell': [], unknown: [] };
   for (const r of rep.got_in) (groups[r.confidence] || groups.unknown).push(r);
-  const gi = ['real', 'unknown', 'likely-blocked', 'likely-shell'].map((k) => {
+  const gi = ['real', 'unknown', 'redirect', 'likely-blocked', 'likely-shell'].map((k) => {
     const rows = groups[k];
     if (!rows.length) return '';
     const [label, help] = CONF_LABEL[k];
@@ -523,6 +524,7 @@ const CONF_TAG = {
   refused: ['refused', 'The server turned this request away (401/403/429)'],
   'not-found': ['not found', 'No such resource (404 and similar)'],
   error: ['error', 'The server failed on this request (5xx)'],
+  redirect: ['redirect', 'Pointed somewhere else (3xx) — a signpost, not content'],
   'likely-blocked': ['blocked', 'Byte-identical to the parked block page — refused'],
   'likely-shell': ['shell', 'Byte-identical to the catch-all page — nothing served'],
   unknown: ['unknown', 'No size recorded — cannot tell'],

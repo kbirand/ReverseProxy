@@ -425,6 +425,7 @@ h4.conf-real { color: #b3261e; }
 h4.conf-unknown { color: #8a6d00; }
 h4.conf-likely-blocked { color: #1d7a4c; }
 h4.conf-likely-shell { color: #6b7280; }
+h4.conf-redirect { color: #5c6bc0; }
 
 /* Six verdicts, each needing to be told apart at a glance. The previous noise
    and quiet greys (#6b7280 / #8a9199) were near-identical — the two most common
@@ -480,3 +481,4 @@ h4.conf-likely-shell { color: #6b7280; }
 .cf-real{background:#c62828} .cf-likely-blocked{background:#1d7a4c}
 .cf-likely-shell{background:#546e7a} .cf-unknown{background:#b8860b}
 .cf-refused{background:#2e7d5b} .cf-not-found{background:#9aa5ab} .cf-error{background:#e08600}
+.cf-redirect{background:#5c6bc0}

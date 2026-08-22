@@ -492,3 +492,182 @@ test('served responses still get the size-based verdict', () => {
   assert.equal(out.find((p) => p.uri === '/s0').confidence, 'likely-shell');
   assert.equal(out.find((p) => p.uri === '/real').confidence, 'real');
 });
+
+// A scan that FINDS something is the case that matters, and it was the one case
+// the verdict dropped. The scan test correctly fired on distinct_paths, then the
+// inner `real === 0` gate discarded it whenever anything had been served, so the
+// row fell through to the closing "ordinary traffic" default. 20.196.209.81 walked
+// 223 paths in 77 seconds, got 6 real responses, and was reported as ordinary.
+function scanRow(over = {}) {
+  return {
+    client_ip: '20.196.209.81', requests: 445, bytes: 771500, distinct_paths: 223,
+    real: 0, blocked: 0, shell: 0, unknown: 0, failures: 2, real_sensitive: 0,
+    probes: 223, is_hosting: true, top_host: 'www.koraybirand.co.uk',
+    protected_top_host: false, content: { media: 0, api: 0, archive: 0, code: 0, other: 1 },
+    ...over,
+  };
+}
+
+test('a scan that served nothing stays noise', () => {
+  const v = breach.verdictFor(scanRow({ real: 0 }), false);
+  assert.equal(v.level, 'noise');
+  assert.match(v.text, /nothing served/);
+});
+
+test('a scan that served real content escalates to watch, not ordinary traffic', () => {
+  for (const real of [1, 6, 50]) {
+    const v = breach.verdictFor(scanRow({ real }), false);
+    assert.equal(v.level, 'watch', `real=${real} should be watch`);
+    assert.doesNotMatch(v.text, /ordinary traffic/);
+    assert.match(v.text, /scan/i);
+    assert.match(v.text, new RegExp(String(real)));
+  }
+});
+
+test('a successful scan is notifiable, so it actually reaches you', () => {
+  const notify = require('./notify');
+  const v = breach.verdictFor(scanRow({ real: 6 }), false);
+  assert.ok(notify.NOTIFIABLE.includes(v.level),
+    `verdict "${v.level}" must be in NOTIFIABLE or the alert is never delivered`);
+});
+
+test('a sensitive hit still outranks the scan verdict', () => {
+  const v = breach.verdictFor(scanRow({ real: 6, real_sensitive: 2 }), false);
+  assert.equal(v.level, 'alert');
+});
+
+test('allowlisted and internal IPs are never called scans', () => {
+  assert.equal(breach.verdictFor(scanRow({ real: 6 }), true).level, 'yours');
+  assert.equal(breach.verdictFor(scanRow({ client_ip: '192.168.1.67', real: 6 }), false).level, 'internal');
+});
+
+// The first cut of the scan fix regressed exactly here: a visitor browsing a
+// gallery touches 60 distinct paths, which tripped the same distinct_paths test
+// the scanner does. Many paths is not the signal — being REFUSED on them is.
+test('browsing many pages is not a scan when every request is answered', () => {
+  const browsing = {
+    client_ip: '198.51.100.30', requests: 60, bytes: 5000, distinct_paths: 60,
+    real: 60, blocked: 0, shell: 0, unknown: 0, failures: 0, real_sensitive: 0,
+    probes: 0, is_hosting: false, top_host: 'portfolio.example.com',
+    protected_top_host: false, content: { media: 1, api: 0, archive: 0, code: 0, other: 0 },
+  };
+  const v = breach.verdictFor(browsing, false);
+  assert.notEqual(v.level, 'watch', 'a visitor answered on every request is not a scan');
+  assert.doesNotMatch(v.text, /scan/i);
+});
+
+test('being answered on known probe paths is a scan even without refusals', () => {
+  const v = breach.verdictFor(scanRow({ requests: 40, real: 40, probes: 40, failures: 0 }), false);
+  assert.equal(v.level, 'watch', 'hits on probe paths that returned content are worse, not better');
+});
+
+// 168.62.48.100 walked 90 paths and was served exactly once. The verdict said
+// "1 returned real content. Check what was served" — and the table below it
+// showed sixty 404s and not the served row, because it ordered by bytes and cut
+// at 60. Every 404 was 3212 bytes; the served response was smaller, so the one
+// row worth reading sorted below all 89 refusals. Truncation must drop refusals,
+// never evidence.
+test('the served row survives truncation even when it is the smallest', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  for (let i = 0; i < 89; i++) {
+    rows.push({ ts: now, client_ip: '168.62.48.100', host: 'k', method: 'GET',
+      uri: `/wp-includes/blocks/x${i}/index.php`, status: 404, user_agent: 'u',
+      suspicious_path: 1, size: 3212 });
+  }
+  // the single served response, deliberately tiny
+  rows.push({ ts: now, client_ip: '168.62.48.100', host: 'k', method: 'GET',
+    uri: '/the-one-that-answered', status: 200, user_agent: 'u',
+    suspicious_path: 0, size: 412 });
+  db.insertAccessEvents(d, rows);
+
+  const out = breach.pathsForIp(d, '168.62.48.100', { sinceMs: 0, limit: 60 });
+  assert.equal(out.length, 60);
+  const served = out.find((r) => r.uri === '/the-one-that-answered');
+  assert.ok(served, 'the served row must appear despite being the smallest of 90');
+  assert.equal(out[0].uri, '/the-one-that-answered', 'and it must lead the table');
+});
+
+// A redirect is a signpost, not a page. `classify` only ever looked at body size,
+// so any status under 400 that carried bytes was called real content served —
+// 301, 302 and 304 included. That is what put 168.62.48.100 on WATCH: one answer
+// among 90 refusals, counted as content without anyone checking it was content.
+test('redirects are labelled as redirects, not as real content', () => {
+  for (const st of [301, 302, 303, 307, 308, 304]) {
+    assert.equal(breach.classifyPath({ host: 'h', status: st, size: 412 }, new Set(), new Set()),
+      'redirect', `status ${st} is not content`);
+  }
+  assert.equal(breach.classifyPath({ host: 'h', status: 200, size: 412 }, new Set(), new Set()), 'real');
+});
+
+test('a scan answered only by redirects served nothing, so it is not a WATCH', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  for (let i = 0; i < 89; i++) {
+    rows.push({ ts: now, client_ip: '168.62.48.100', host: 'k', method: 'GET',
+      uri: `/wp/x${i}.php`, status: 404, user_agent: 'u', suspicious_path: 1, size: 3212 });
+  }
+  rows.push({ ts: now, client_ip: '168.62.48.100', host: 'k', method: 'GET',
+    uri: '/somewhere', status: 302, user_agent: 'u', suspicious_path: 0, size: 412 });
+  db.insertAccessEvents(d, rows);
+  const r = breach.ipSummary(d, { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '168.62.48.100');
+  assert.equal(r.real, 0, 'a redirect is not a served response');
+  assert.equal(r.verdict.level, 'noise', 'nothing was served, so this is an ordinary scan');
+});
+
+test('the same scan answered by a real page IS a WATCH', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  for (let i = 0; i < 89; i++) {
+    rows.push({ ts: now, client_ip: '168.62.48.100', host: 'k', method: 'GET',
+      uri: `/wp/x${i}.php`, status: 404, user_agent: 'u', suspicious_path: 1, size: 3212 });
+  }
+  rows.push({ ts: now, client_ip: '168.62.48.100', host: 'k', method: 'GET',
+    uri: '/somewhere', status: 200, user_agent: 'u', suspicious_path: 0, size: 412 });
+  db.insertAccessEvents(d, rows);
+  const r = breach.ipSummary(d, { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '168.62.48.100');
+  assert.equal(r.real, 1);
+  assert.equal(r.verdict.level, 'watch', 'a real page among 90 probes still deserves a look');
+});
+
+test('a redirect still appears in the endpoint table — hidden is not the fix', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  db.insertAccessEvents(d, [
+    { ts: now, client_ip: '5.5.5.5', host: 'k', method: 'GET', uri: '/gone',
+      status: 302, user_agent: 'u', suspicious_path: 0, size: 412 },
+    { ts: now, client_ip: '5.5.5.5', host: 'k', method: 'GET', uri: '/missing',
+      status: 404, user_agent: 'u', suspicious_path: 0, size: 3212 },
+  ]);
+  const out = breach.pathsForIp(d, '5.5.5.5', { sinceMs: 0 });
+  const red = out.find((r) => r.uri === '/gone');
+  assert.ok(red, 'the redirect must still be listed');
+  assert.equal(red.confidence, 'redirect');
+});
+
+// The same defect lived in gotIn: it selected status 200-399 and labelled every
+// row with classify(), which reads body size only. A 302 off /admin/ therefore
+// appeared under "got in" as real content. Leaving this while fixing pathsForIp
+// would have the panel calling the same response content on one screen and a
+// signpost on another.
+test('a redirect off a sensitive path is not reported as having got in', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  db.insertAccessEvents(d, [
+    { ts: now, client_ip: '7.7.7.7', host: 'k', method: 'GET', uri: '/admin/users',
+      status: 302, user_agent: 'u', suspicious_path: 0, size: 412 },
+    { ts: now, client_ip: '7.7.7.7', host: 'k', method: 'GET', uri: '/admin/keys',
+      status: 200, user_agent: 'u', suspicious_path: 0, size: 9000 },
+  ]);
+  const rows = breach.gotIn(d, { sinceMs: 0, hostsWithAcl: new Set() });
+  const red = rows.find((r) => r.uri === '/admin/users');
+  const page = rows.find((r) => r.uri === '/admin/keys');
+  assert.ok(red, 'the redirect stays visible — hiding it is not the fix');
+  assert.equal(red.confidence, 'redirect', 'but it is not real content');
+  assert.equal(page.confidence, 'real', 'a genuine 200 is untouched');
+});
