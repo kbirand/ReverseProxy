@@ -671,3 +671,59 @@ test('a redirect off a sensitive path is not reported as having got in', () => {
   assert.equal(red.confidence, 'redirect', 'but it is not real content');
   assert.equal(page.confidence, 'real', 'a genuine 200 is untouched');
 });
+
+// Cloudflare hands us the visitor's real address, and for anyone with IPv6 that
+// address is IPv6 — even though this estate has no IPv6 route of its own and
+// Caddy is reached over IPv4. inAllowlist parsed addresses with an IPv4-only
+// routine and returned false for everything else, so an allowlisted guest read
+// as an unrecognised outsider and blockGuard offered to block them. The same
+// applies to you the first time you browse on mobile data.
+test('inAllowlist matches IPv6 literals and prefixes', () => {
+  const allow = new Set(['212.154.65.70', '2a02:ff0:254:9e28::/64']);
+  assert.equal(breach.inAllowlist('2a02:ff0:254:9e28:2cca:f431:790f:4e90', allow), true,
+    'the /64 must cover a rotating privacy address');
+  assert.equal(breach.inAllowlist('2a02:ff0:254:9e29:2cca:f431:790f:4e90', allow), false,
+    'a different /64 is a different subscriber');
+  assert.equal(breach.inAllowlist('212.154.65.70', allow), true, 'IPv4 still works');
+});
+
+test('inAllowlist compares like for like, and normalises IPv6 spelling', () => {
+  assert.equal(breach.inAllowlist('::1', new Set(['0:0:0:0:0:0:0:1'])), true,
+    'the same address written two ways is the same address');
+  assert.equal(breach.inAllowlist('2a02:ff0::1', new Set(['10.0.0.0/8'])), false,
+    'an IPv4 range never matches an IPv6 address');
+  assert.equal(breach.inAllowlist('10.0.0.5', new Set(['::/0'])), false,
+    'and an IPv6 range never matches an IPv4 address');
+  assert.equal(breach.inAllowlist('::ffff:212.154.65.70', new Set(['212.154.65.70'])), true,
+    'an IPv4-mapped address is that IPv4 address');
+});
+
+test('blockGuard protects an allowlisted IPv6 guest', () => {
+  const allow = new Set(['2a02:ff0:254:9e28::/64']);
+  const ip = '2a02:ff0:254:9e28:2cca:f431:790f:4e90';
+  const verdict = breach.verdictFor({ client_ip: ip, requests: 5, bytes: 100, distinct_paths: 3,
+    real: 5, blocked: 0, shell: 0, unknown: 0, failures: 0, real_sensitive: 0, probes: 0,
+    is_hosting: false, content: { media: 0, api: 0, archive: 0, code: 0, other: 1 } },
+    breach.inAllowlist(ip, allow));
+  assert.equal(verdict.level, 'yours', 'an allowlisted guest is yours, not an outsider');
+  assert.equal(breach.blockGuard({ client_ip: ip, verdict }).allowed, false,
+    'and the panel must refuse to block them');
+});
+
+test('isInternal knows IPv6 private ranges', () => {
+  assert.equal(breach.isInternal('fd12:3456::1'), true, 'unique-local is this network');
+  assert.equal(breach.isInternal('fe80::1'), true, 'link-local is this wire');
+  assert.equal(breach.isInternal('::1'), true);
+  assert.equal(breach.isInternal('2a02:ff0:254:9e28::1'), false, 'a public address is not internal');
+  assert.equal(breach.isInternal('192.168.1.67'), true, 'IPv4 unchanged');
+  assert.equal(breach.isInternal('8.8.8.8'), false);
+});
+
+test('malformed addresses are rejected, never matched', () => {
+  const allow = new Set(['2a02:ff0:254:9e28::/64', '10.0.0.0/8']);
+  for (const bad of ['', 'not-an-ip', '10.0.0', '10.0.0.256', '1:2:3::4::5', 'gggg::1', '2a02:ff0:254:9e28::/999']) {
+    assert.equal(breach.inAllowlist(bad, allow), false, `${bad} must not match`);
+  }
+  assert.equal(breach.inAllowlist('10.0.0.5', new Set(['2a02:ff0:254:9e28::/999'])), false,
+    'a malformed ENTRY must not match either');
+});

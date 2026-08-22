@@ -153,44 +153,132 @@ function contentClass(uri) {
 
 const BIG_TRANSFER = 100 * 1024 * 1024; // 100 MB from one IP is worth a look
 
-// IPv4 CIDR / literal membership. The allowlist is authored as CIDRs
+// Address membership for both families. The allowlist is authored as CIDRs
 // (192.168.1.0/24, 100.64.0.0/10), so literal string matching silently fails
 // and flags your own LAN as an intruder.
-function ip4ToInt(ip) {
-  const p = String(ip).split('.');
-  if (p.length !== 4) return null;
-  let n = 0;
-  for (const o of p) {
-    const v = Number(o);
-    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
-    n = (n * 256) + v;
+//
+// IPv6 matters here even though this estate has no IPv6 route: sites sit behind
+// Cloudflare, which accepts the visitor over IPv6 and reports that address in
+// CF-Connecting-IP. The connection reaching Caddy is IPv4; the identity is not.
+// Parsing with an IPv4-only routine returned false for every such visitor, so an
+// allowlisted guest read as an unrecognised outsider and blockGuard — which
+// exists to stop you locking yourself out — offered to block them.
+//
+// Consumer IPv6 addresses rotate (RFC 4941 privacy addressing) while the /64
+// prefix stays put, so prefix matching is what makes an entry hold.
+function ipToBytes(ip) {
+  if (typeof ip !== 'string') return null;
+  let s = ip.trim();
+  if (!s) return null;
+  const pct = s.indexOf('%');           // fe80::1%eth0 — drop the zone
+  if (pct >= 0) s = s.slice(0, pct);
+  if (s.includes(':')) return ipv6ToBytes(s);
+  const parts = s.split('.');
+  if (parts.length !== 4) return null;
+  const out = new Uint8Array(4);
+  for (let i = 0; i < 4; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return null;
+    const v = Number(parts[i]);
+    if (v > 255) return null;
+    out[i] = v;
   }
-  return n;
+  return out;
+}
+
+function ipv6ToBytes(s) {
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  // A trailing IPv4 literal (::ffff:1.2.3.4) occupies the final two groups.
+  const expand = (text) => {
+    if (!text) return [];
+    const groups = text.split(':');
+    const out = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (g.includes('.')) {
+        if (i !== groups.length - 1) return null;
+        const b = ipToBytes(g);
+        if (!b || b.length !== 4) return null;
+        out.push((b[0] << 8) | b[1], (b[2] << 8) | b[3]);
+        continue;
+      }
+      if (!/^[0-9a-f]{1,4}$/i.test(g)) return null;
+      out.push(parseInt(g, 16));
+    }
+    return out;
+  };
+  const head = expand(halves[0]);
+  if (head === null) return null;
+  let groups;
+  if (halves.length === 1) {
+    groups = head;
+  } else {
+    const tail = expand(halves[1]);
+    if (tail === null) return null;
+    const fill = 8 - head.length - tail.length;
+    if (fill < 0) return null;
+    groups = head.concat(new Array(fill).fill(0), tail);
+  }
+  if (groups.length !== 8) return null;
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) { out[i * 2] = (groups[i] >> 8) & 255; out[i * 2 + 1] = groups[i] & 255; }
+  // ::ffff:a.b.c.d IS that IPv4 address — compare it as one, or an entry written
+  // in either notation misses the same visitor.
+  if (out.slice(0, 10).every((v) => v === 0) && out[10] === 255 && out[11] === 255) {
+    return out.slice(12);
+  }
+  return out;
+}
+
+// An entry with no prefix length is an exact address.
+function inCidr(ipBytes, entry) {
+  const slash = entry.indexOf('/');
+  const base = ipToBytes(slash < 0 ? entry : entry.slice(0, slash));
+  // Different families never match: an IPv4 range must not swallow an IPv6
+  // address, nor ::/0 every IPv4 one.
+  if (!base || base.length !== ipBytes.length) return false;
+  let bits = base.length * 8;
+  if (slash >= 0) {
+    const text = entry.slice(slash + 1);
+    if (!/^\d{1,3}$/.test(text)) return false;
+    bits = Number(text);
+    if (bits > base.length * 8) return false;
+  }
+  const whole = bits >> 3;
+  for (let i = 0; i < whole; i++) if (ipBytes[i] !== base[i]) return false;
+  const rem = bits & 7;
+  if (rem) {
+    const mask = (0xff << (8 - rem)) & 0xff;
+    if ((ipBytes[whole] & mask) !== (base[whole] & mask)) return false;
+  }
+  return true;
 }
 
 function inAllowlist(ip, entries) {
   if (!entries || !entries.size) return false;
   if (entries.has(ip)) return true;
-  const n = ip4ToInt(ip);
-  if (n === null) return false;
+  const bytes = ipToBytes(ip);
+  if (!bytes) return false;
   for (const e of entries) {
-    const slash = e.indexOf('/');
-    if (slash < 0) continue;
-    const base = ip4ToInt(e.slice(0, slash));
-    const bits = Number(e.slice(slash + 1));
-    if (base === null || !Number.isInteger(bits) || bits < 0 || bits > 32) continue;
-    const mask = bits === 0 ? 0 : (-1 << (32 - bits)) >>> 0;
-    if (((n & mask) >>> 0) === ((base & mask) >>> 0)) return true;
+    if (inCidr(bytes, String(e).trim())) return true;
   }
   return false;
 }
 
-// Loopback and RFC1918: this machine, or something on the same wire.
+// Loopback and RFC1918, and their IPv6 equivalents: this machine, or something
+// on the same wire.
 function isInternal(ip) {
-  if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') return true;
-  const n = ip4ToInt(ip);
-  if (n === null) return false;
-  return inAllowlist(ip, new Set(['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16']));
+  if (ip === 'localhost') return true;
+  const b = ipToBytes(ip);
+  if (!b) return false;
+  if (b.length === 16) {
+    if (b.every((v, i) => (i === 15 ? v === 1 : v === 0))) return true;   // ::1
+    if ((b[0] & 0xfe) === 0xfc) return true;                              // fc00::/7 unique-local
+    if (b[0] === 0xfe && (b[1] & 0xc0) === 0x80) return true;             // fe80::/10 link-local
+    return false;
+  }
+  return inAllowlist(ip, new Set(['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12',
+    '192.168.0.0/16', '169.254.0.0/16']));
 }
 
 function ipLabel(info) {
