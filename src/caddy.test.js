@@ -341,3 +341,46 @@ test('blockPage also covers the global blocklist route', () => {
   assert.equal(resp.status_code, 200);
   assert.match(resp.body, /available for sale/i);
 });
+
+// ---- fallback route is loopback-only ---------------------------------------
+// The fallback serves a local admin dashboard (ProxySQL) that has NO
+// authentication of its own and can fail over the database cluster via sudo.
+// Matching on Host alone is not access control: any LAN client can send
+// `Host: localhost` and reach it. The route must also require a loopback
+// CLIENT address.
+
+test('the fallback route requires a loopback client IP, not just a matching Host', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http' }], {
+    fallbackUpstream: '127.0.0.1:8081',
+    fallbackHosts: ['127.0.0.1', 'localhost', '::1', '192.168.1.99'],
+  });
+  const fb = cfg.apps.http.servers.srv_http.routes.find((r) =>
+    r.handle && r.handle.some((h) => h.handler === 'reverse_proxy'
+      && h.upstreams && h.upstreams[0].dial === '127.0.0.1:8081'));
+  assert.ok(fb, 'fallback route exists');
+  const m = fb.match[0];
+  assert.ok(m.client_ip, 'fallback must constrain the client address');
+  assert.deepEqual(m.client_ip.ranges.sort(), ['127.0.0.1/32', '::1/128'].sort());
+  assert.ok(m.host.includes('192.168.1.99'), 'host matching still applies');
+});
+
+test('the loopback constraint can be widened deliberately, not by accident', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http' }], {
+    fallbackUpstream: '127.0.0.1:8081',
+    fallbackHosts: ['127.0.0.1'],
+    fallbackClientIps: ['127.0.0.1/32', '::1/128', '192.168.1.0/24'],
+  });
+  const fb = cfg.apps.http.servers.srv_http.routes.find((r) =>
+    r.match && r.match[0] && r.match[0].client_ip && r.match[0].host
+    && r.handle.some((h) => h.handler === 'reverse_proxy'
+      && h.upstreams && h.upstreams[0].dial === '127.0.0.1:8081'));
+  assert.ok(fb, 'fallback route exists');
+  assert.ok(fb.match[0].client_ip.ranges.includes('192.168.1.0/24'));
+});
+
+test('no fallback upstream means no fallback route at all', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'http' }], { fallbackUpstream: '' });
+  const fb = cfg.apps.http.servers.srv_http.routes.find((r) =>
+    r.match && r.match[0] && r.match[0].client_ip && r.match[0].host);
+  assert.equal(fb, undefined);
+});

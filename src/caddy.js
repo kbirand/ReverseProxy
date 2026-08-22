@@ -24,6 +24,18 @@ const DEFAULT_FALLBACK_HOSTS = (process.env.FALLBACK_HOSTS
   || '127.0.0.1,localhost,::1')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
+// Which CLIENT addresses may use the fallback. Loopback only by default.
+//
+// Host matching is not access control: a request from anywhere on the LAN can
+// carry `Host: localhost` and match the fallback hosts exactly. The upstream
+// here is typically a local admin dashboard with no authentication of its own —
+// the ProxySQL one can fail the database cluster over via sudo — so the route
+// also requires the connection itself to come from loopback. Widen it only
+// deliberately, via FALLBACK_CLIENT_IPS.
+const DEFAULT_FALLBACK_CLIENT_IPS = (process.env.FALLBACK_CLIENT_IPS
+  || '127.0.0.1/32,::1/128')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+
 // Cloudflare edge IP ranges (https://www.cloudflare.com/ips/). Registered as
 // trusted_proxies so the `client_ip` matcher resolves the *real* visitor IP
 // from X-Forwarded-For instead of seeing Cloudflare's edge address. Without
@@ -556,9 +568,10 @@ function renderConfig(rules, opts = {}) {
   // a local admin dashboard. When FALLBACK_UPSTREAM is empty, this is skipped
   // and those requests get the clean 404 below, same as any unknown host.
   const fallbackHosts = opts.fallbackHosts || DEFAULT_FALLBACK_HOSTS;
+  const fallbackClientIps = opts.fallbackClientIps || DEFAULT_FALLBACK_CLIENT_IPS;
   if (fallbackUpstream && fallbackHosts.length) {
     httpRoutes.push({
-      match: [{ host: fallbackHosts }],
+      match: [{ host: fallbackHosts, client_ip: { ranges: fallbackClientIps } }],
       handle: [
         {
           handler: 'reverse_proxy',
@@ -716,4 +729,5 @@ module.exports = {
   DEFAULT_CERT_DIR,
   DEFAULT_ACCESS_LOG,
   DEFAULT_ADMIN,
+  DEFAULT_FALLBACK_CLIENT_IPS,
 };
