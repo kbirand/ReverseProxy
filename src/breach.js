@@ -329,7 +329,16 @@ function verdictFor(r, allowlisted) {
     // whether the requests were ANSWERED. A scanner is mostly refused (6 of 445
     // here); a visitor is mostly served (60 of 60). Hits on known probe paths count
     // too — being answered on those is worse than being refused, not better.
-    const mostlyUnanswered = r.real * 2 < r.requests;
+    // What separates a scanner from a busy client is how often the server said
+    // "no such thing". `real * 2 < requests` stood in for that and was too
+    // crude: an API client whose responses are half real and half same-sized
+    // JSON (classified shell) tripped it, and a colleague using the product was
+    // reported as an intruder. Anything the server actually answered — real,
+    // shell, blocked, unknown — counts as answered; what is left is the 404s.
+    // On real traffic that ratio is 99% for a scanner and 16% for a client.
+    const answered = (r.real || 0) + (r.shell || 0) + (r.blocked || 0) + (r.unknown || 0);
+    const unanswered = Math.max(0, r.requests - answered);
+    const mostlyUnanswered = r.requests > 0 && unanswered / r.requests >= 0.6;
     if (mostlyUnanswered || r.probes >= 20) {
       return {
         level: 'watch',

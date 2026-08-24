@@ -727,3 +727,52 @@ test('malformed addresses are rejected, never matched', () => {
   assert.equal(breach.inAllowlist('10.0.0.5', new Set(['2a02:ff0:254:9e28::/999'])), false,
     'a malformed ENTRY must not match either');
 });
+
+// `real * 2 < requests` was too crude a stand-in for "mostly refused". A busy
+// API client trips it: 95.70.219.213 made 3,307 requests over 256 distinct paths
+// — every workflow-image id is its own URI — and 1,638 came back as real content
+// with another 1,128 classified as shell because the API answers many endpoints
+// with same-sized JSON. Just over half not-real, so it read as a scan, and a
+// colleague using the product was reported as an intruder.
+//
+// What actually separates them is how often the server said "no such thing".
+// A scanner is refused on nearly everything; a client is refused on almost
+// nothing. That ratio is 99% versus 16% on real traffic.
+function row(over = {}) {
+  return {
+    client_ip: '198.51.100.1', requests: 100, bytes: 1000, distinct_paths: 50,
+    real: 0, blocked: 0, shell: 0, unknown: 0, failures: 0, real_sensitive: 0,
+    probes: 0, is_hosting: false, top_host: 'h', protected_top_host: false,
+    content: { media: 0, api: 0, archive: 0, code: 0, other: 1 }, ...over,
+  };
+}
+
+test('a busy API client is not a scan, even across hundreds of paths', () => {
+  const v = breach.verdictFor(row({
+    requests: 3307, distinct_paths: 256, real: 1638, shell: 1128, bytes: 3.2e9,
+    content: { media: 0.05, api: 0.95, archive: 0, code: 0, other: 0 },
+  }), false);
+  // It may still be flagged on VOLUME — 3.2 GB from an address the panel does
+  // not recognise is worth a look — but it must not be called a scan, which is
+  // the part that was wrong and the part that makes the report unreadable.
+  assert.doesNotMatch(v.text, /scan/i, '16% refused is a client, not a scanner');
+  assert.match(v.text, /GB|MB/, 'the honest reason is the volume');
+});
+
+test('a scanner refused on nearly everything is still caught', () => {
+  const v = breach.verdictFor(row({ requests: 445, distinct_paths: 223, real: 6, probes: 223 }), false);
+  assert.equal(v.level, 'watch');
+  assert.match(v.text, /scan/i);
+});
+
+test('and one refused on everything stays noise', () => {
+  const v = breach.verdictFor(row({ requests: 445, distinct_paths: 223, real: 0, probes: 223 }), false);
+  assert.equal(v.level, 'noise');
+});
+
+test('shell responses count as answered — the server did reply', () => {
+  // An SPA catch-all and an API returning same-sized JSON both land in `shell`.
+  // Neither is the server saying "no such thing", which is what marks a scan.
+  const v = breach.verdictFor(row({ requests: 200, distinct_paths: 100, real: 10, shell: 180 }), false);
+  assert.notEqual(v.level, 'watch');
+});
