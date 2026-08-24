@@ -979,7 +979,7 @@ async function onTsdnsApply() {
 
 function switchView(view) {
   state.view = view;
-  for (const v of ['rules', 'activity', 'blocklist', 'firewall', 'breach']) {
+  for (const v of ['rules', 'activity', 'blocklist', 'firewall', 'breach', 'tsdns']) {
     $(`#view-${v}`).hidden = view !== v;
     $(`#nav-${v}`).classList.toggle('active', view === v);
   }
@@ -988,6 +988,7 @@ function switchView(view) {
   if (view === 'blocklist') loadBlocklist();
   if (view === 'firewall') loadFirewall();
   if (view === 'breach') loadBreach();
+  if (view === 'tsdns') loadTsdns();
 }
 
 async function loadActivity(opts = {}) {
