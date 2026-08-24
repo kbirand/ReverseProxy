@@ -156,20 +156,36 @@ const REAL_ROW = {
 };
 
 test('served endpoints appear, redacted and capped', () => {
+  const filler = Array.from({ length: 20 }, (_, i) =>
+    ({ uri: `/api/items/${i}`, confidence: 'real', bytes: 1000 - i }));
   const msg = notify.buildMessage(REAL_ROW, {
     paths: [
       { uri: '/api/backups/download?file=prod-2026-08.sql.gz&token=abcd', confidence: 'real', bytes: 9_900_000 },
       { uri: '/api/uploads/082026/19/assets/wf-gen-1787136210669.jpg', confidence: 'real', bytes: 9_100_000 },
       { uri: '/admin/users', confidence: 'real', bytes: 4_000 },
       { uri: '/wp-login.php', confidence: 'not-found', bytes: 3_212 },
+      ...filler,
       { uri: '/never-shown', confidence: 'real', bytes: 1 },
     ],
   });
   assert.match(msg.body, /\/api\/backups\/download/, 'the endpoint shape is the point');
   assert.doesNotMatch(msg.body, /prod-2026-08/, 'a filename is not shape, it is content');
   assert.doesNotMatch(msg.body, /abcd/, 'and a token must never ride a lock screen');
-  assert.doesNotMatch(msg.body, /wp-login/, 'only what was actually SERVED is listed');
-  assert.doesNotMatch(msg.body, /never-shown/, 'capped at three');
+  const reached = msg.body.split('Probed:')[0];
+  assert.doesNotMatch(reached, /wp-login/, 'a 404 is never listed as reached');
+  assert.doesNotMatch(msg.body, /never-shown/, 'the cap still holds, just further out');
+});
+
+// Three endpoints could not answer "legitimate, or block it?". A dozen can show
+// the shape of the traffic, which is the whole reason they are in the message.
+test('enough endpoints ride along to judge a source', () => {
+  const paths = Array.from({ length: 30 }, (_, i) =>
+    ({ uri: `/api/thing/${i}`, confidence: 'real', bytes: 5000 - i }));
+  const msg = notify.buildMessage(REAL_ROW, { paths });
+  const listed = msg.body.split('\n').filter((l) => l.startsWith('  /api/thing/'));
+  assert.equal(listed.length, 12, 'twelve served paths, ordered by what breach.pathsForIp ranked first');
+  assert.match(msg.body, /…and 18 more/, 'and the remainder is counted, not silently dropped');
+  assert.ok(Buffer.byteLength(msg.body, 'utf8') < 4096, "ntfy's body limit is 4 KB");
 });
 
 test('a message with no path data is unchanged', () => {
@@ -208,4 +224,46 @@ test('send omits the Actions header entirely when there is none', async () => {
   await notify.send({ title: 't', body: 'b' },
     { topic: 'topic', fetchImpl: async (url, init) => { seen = init; return { ok: true }; } });
   assert.ok(!('Actions' in seen.headers), 'an empty header is not the same as no header');
+});
+
+// The message listed only what was SERVED. For 44.223.80.249 that was two hits
+// on `/` — which reads as an ordinary visitor, while the other 257 requests were
+// a sweep for .env, .env.prod, .env.backup, .git/config and phpinfo. Judging
+// whether to block needs the shape of what was REFUSED, and the phone is where
+// that judgement gets made.
+const SWEEP_ROW = {
+  client_ip: '44.223.80.249', top_host: 'videoevaluator.com',
+  requests: 259, bytes: 826800, real: 2, failures: 0,
+  verdict: { level: 'watch', text: 'Automated scan — 259 requests across 258 paths.' },
+};
+
+test('the message shows what was refused, not just what was served', () => {
+  const paths = [
+    { uri: '/', confidence: 'real', bytes: 679 },
+    { uri: '/.env', confidence: 'not-found', bytes: 3212 },
+    { uri: '/.env.production', confidence: 'not-found', bytes: 3212 },
+    { uri: '/.git/config', confidence: 'not-found', bytes: 3212 },
+    { uri: '/admin/phpinfo.php', confidence: 'not-found', bytes: 3212 },
+    { uri: '/aws/.env', confidence: 'not-found', bytes: 3212 },
+  ];
+  const msg = notify.buildMessage(SWEEP_ROW, { paths });
+  assert.match(msg.body, /Reached:/, 'what was served still leads');
+  assert.match(msg.body, /Probed:/, 'and what was refused now appears');
+  assert.match(msg.body, /\.env/, 'the shape of the sweep is the thing being judged');
+  assert.match(msg.body, /5 refused/, 'with a count, so three examples are not mistaken for all of it');
+});
+
+test('nothing refused means no Probed section at all', () => {
+  const msg = notify.buildMessage(SWEEP_ROW, {
+    paths: [{ uri: '/', confidence: 'real', bytes: 679 }],
+  });
+  assert.doesNotMatch(msg.body, /Probed:/);
+});
+
+test('refused paths are redacted and capped like served ones', () => {
+  const paths = Array.from({ length: 40 }, (_, i) => (
+    { uri: `/secret${i}/.env?token=abcd`, confidence: 'not-found', bytes: 3212 }));
+  const msg = notify.buildMessage(SWEEP_ROW, { paths });
+  assert.doesNotMatch(msg.body, /abcd/, 'a query value must not ride a lock screen');
+  assert.ok(msg.body.split('\n').length < 20, 'and the message stays readable');
 });

@@ -26,11 +26,55 @@ const { reloadCaddy: defaultReload } = require('../sync');
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_MAX = 20;
 
+// Every request arrives through Caddy, which dials loopback, so req.ip is
+// 127.0.0.1 for all of them — keying on it would put the whole internet in ONE
+// bucket, and 21 requests a minute from anywhere would 429 the operator's own
+// button for the rest of the window. Caddy sets X-Block-Client-Ip on this route
+// from its resolved client_ip, which honours trusted_proxies (so behind
+// Cloudflare it is the real visitor, not a CF edge node).
+//
+// The header is only trusted when the request really did come from loopback.
+// Anyone already on the box could forge it, but they can reach :8080 directly
+// and do not need this route; from the internet the header cannot be set,
+// because Caddy overwrites it on the way through.
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+function sourceKey(req) {
+  const peer = req.socket?.remoteAddress || '';
+  if (LOOPBACK.has(peer)) {
+    const fromCaddy = (req.get('x-block-client-ip') || '').trim();
+    if (fromCaddy) return fromCaddy;
+  }
+  return req.ip || peer || 'unknown';
+}
+
 function buildRouter(database, opts = {}) {
   const r = express.Router();
   const reloadCaddy = opts.reloadCaddy === undefined ? defaultReload : opts.reloadCaddy;
   const secretFor = opts.secret;
+  const confirm = opts.confirm || null;
   const hits = new Map();
+
+  // Feedback for a tap. The button lives inside a notification, and the phone
+  // shows nothing for the HTTP response — you tap it and cannot tell whether
+  // anything happened. That is not a cosmetic gap on a security control: the
+  // first live test was tapped twice for exactly this reason, and both taps
+  // were silently landing on a 404 at the time. So every outcome comes back as
+  // its own notification.
+  //
+  // Only signature-verified taps notify. This endpoint is public, and if a bad
+  // token also pushed, anyone who found the path could ring the phone at will —
+  // the rate limiter would cap that flood at 20 a minute rather than stop it.
+  //
+  // Never awaited and never allowed to throw: the tap's own response must not
+  // wait on ntfy, and a push outage must not turn a successful block into an
+  // error on the phone.
+  const tell = (title, body, priority, tags) => {
+    if (!confirm) return;
+    try {
+      const out = confirm({ title, body, priority, tags });
+      if (out && typeof out.catch === 'function') out.catch(() => {});
+    } catch { /* feedback is never worth failing the action for */ }
+  };
 
   const rateLimited = (key, now) => {
     const seen = (hits.get(key) || []).filter((t) => now - t < RATE_WINDOW_MS);
@@ -42,7 +86,7 @@ function buildRouter(database, opts = {}) {
 
   r.post('/:token', async (req, res) => {
     const now = Date.now();
-    const peer = req.ip || req.socket?.remoteAddress || 'unknown';
+    const peer = sourceKey(req);
     if (rateLimited(peer, now)) {
       return res.status(429).type('text/plain').send('Too many attempts. Try again shortly.');
     }
@@ -50,6 +94,14 @@ function buildRouter(database, opts = {}) {
     const secret = typeof secretFor === 'function' ? secretFor() : secretFor;
     const check = blockToken.verify(req.params.token, { secret, now });
     if (!check.ok) {
+      // A token whose SIGNATURE was good but whose day ran out came from a real
+      // notification, so it earns an answer — otherwise tapping an old alert
+      // looks identical to tapping a working one. A forged or malformed token
+      // says nothing back, on the wire or to the phone.
+      if (check.reason === 'expired' && check.ip) {
+        tell('Block link expired', `${check.ip} was NOT blocked — that alert is over a day old. `
+          + 'Block it from the panel if it still matters.', 4, 'hourglass');
+      }
       // One message for every failure mode: a caller probing this endpoint
       // learns nothing about whether a token was wrong, stale, or unsigned.
       return res.status(403).type('text/plain').send('This block link is not valid or has expired.');
@@ -65,21 +117,28 @@ function buildRouter(database, opts = {}) {
       verdict: { level: breach.inAllowlist(ip, allow) ? 'yours' : 'other' },
     });
     if (!guard.allowed) {
+      tell('Not blocked', `${ip}: ${guard.reason}`, 4, 'warning');
       return res.status(409).type('text/plain').send(`Not blocked: ${guard.reason}`);
     }
 
     // Already blocked is a success, not an error: tapping the button twice from
     // two notifications must not read as a failure.
     const already = db.listGlobalBlocks(database).some((b) => b.ip === ip);
-    if (already) return res.status(200).type('text/plain').send(`${ip} was already blocked.`);
+    if (already) {
+      tell('Already blocked', `${ip} was already on the blocklist — an earlier tap worked. `
+        + 'Nothing changed.', 3, 'white_check_mark');
+      return res.status(200).type('text/plain').send(`${ip} was already blocked.`);
+    }
 
     db.addGlobalBlock(database, ip, 'blocked from a notification');
     try {
       if (reloadCaddy) await reloadCaddy(database);
     } catch (e) {
       db.removeGlobalBlock(database, ip);
+      tell('Block FAILED', `${ip} is NOT blocked: ${e.message}`, 5, 'x');
       return res.status(502).type('text/plain').send(`Could not apply the block: ${e.message}`);
     }
+    tell('Blocked', `${ip} is now blocked at the proxy, for every host.`, 3, 'white_check_mark');
     res.status(200).type('text/plain').send(`Blocked ${ip}.`);
   });
 

@@ -64,7 +64,9 @@ function verify(token, opts = {}) {
   if (!Number.isFinite(exp)) return { ok: false, reason: 'malformed' };
 
   const now = opts.now == null ? Date.now() : opts.now;
-  if (now > exp) return { ok: false, reason: 'expired' };
+  // The ip rides along on an expired token so the caller can say WHICH address
+  // was not blocked. It is not authorisation — callers must gate on `ok`.
+  if (now > exp) return { ok: false, reason: 'expired', ip };
   return { ok: true, ip };
 }
 

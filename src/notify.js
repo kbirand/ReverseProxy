@@ -57,7 +57,19 @@ function mb(n) {
 // How many served endpoints ride along, and how much of each. "Check what was
 // served" is unanswerable without them, but they cross ntfy and land on a lock
 // screen, so: only what was actually served, only the path, never the query.
-const MAX_ENDPOINTS = 3;
+//
+// Three turned out to be too few to act on. The question a notification has to
+// answer is "is this legitimate, or do I block it?", and three paths rarely
+// separate a customer hitting an API from a scanner walking one — the shape of
+// the traffic only shows up over a dozen. The list is ordered served-first then
+// by bytes (see breach.pathsForIp), so what survives the cap is the evidence
+// that matters. Still well inside ntfy's 4 KB body: 12 lines of at most 61
+// characters is under 800 bytes.
+const MAX_ENDPOINTS = 12;
+// Refused paths are supporting context, not the evidence, so fewer of them:
+// three .env variants already convey the shape of a sweep, and the count
+// beside them carries the scale.
+const MAX_PROBED = 4;
 const MAX_PATH = 60;
 
 function endpointLines(paths) {
@@ -74,6 +86,26 @@ function endpointLines(paths) {
   const more = served.length - lines.length;
   if (more > 0) lines.push(`  …and ${more} more`);
   return ['', 'Reached:', ...lines];
+}
+
+// What the server turned away. Without it the message showed 44.223.80.249 as
+// two hits on `/` — indistinguishable from a passer-by — while the other 257
+// requests swept for .env, .env.production, .git/config and phpinfo. Deciding
+// whether to block is a judgement about the SHAPE of what was probed, and that
+// judgement gets made on a phone, from this message.
+function probedLines(paths) {
+  if (!Array.isArray(paths) || !paths.length) return [];
+  const refused = paths.filter((p) => p && (p.confidence === 'not-found' || p.confidence === 'refused'));
+  if (!refused.length) return [];
+  const lines = refused.slice(0, MAX_PROBED).map((p) => {
+    const cut = String(p.uri || '').split(/[?#]/)[0];
+    const short = cut.length > MAX_PATH ? `${cut.slice(0, MAX_PATH - 1)}…` : cut;
+    return `  ${short}`;
+  });
+  // The count matters as much as the examples: three .env paths look like a
+  // typo, three of two hundred and fifty look like a sweep.
+  return ['', `Probed: ${refused.length} refused`, ...lines,
+    ...(refused.length > lines.length ? [`  …and ${refused.length - lines.length} more`] : [])];
 }
 
 // ntfy splits the Actions header on commas, so no field may contain one. An IP
@@ -96,6 +128,7 @@ function buildMessage(row, opts = {}) {
       `Volume: ${row.requests} requests · ${mb(row.bytes)}`,
       `Served: real ${row.real} · refused ${row.failures}`,
       ...endpointLines(opts.paths),
+      ...probedLines(opts.paths),
     ].join('\n'),
     priority: style.priority,
     tags: style.tags,
