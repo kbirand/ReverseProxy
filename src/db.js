@@ -106,6 +106,12 @@ function migrate(db) {
   if (!cols.includes('access_mode')) {
     db.exec("ALTER TABLE rules ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'blacklist'");
   }
+  // Whether this host resolves to the tailnet address for Tailscale clients.
+  // Off by default: the toggle changes how a host is REACHED, and flipping that
+  // silently on existing rules would be a surprise.
+  if (!cols.includes('tailnet_dns')) {
+    db.exec('ALTER TABLE rules ADD COLUMN tailnet_dns INTEGER NOT NULL DEFAULT 0');
+  }
   // Response size: needed to tell a real payload from an SPA catch-all shell or
   // the parked block page, both of which answer 200. Older rows stay NULL.
   try {
@@ -118,14 +124,14 @@ function migrate(db) {
 const COLUMNS = [
   'hostname','backend_host','backend_port','backend_tls','add_www',
   'tls_mode','cert_path','websocket','hsts','read_timeout','enabled','notes',
-  'deny_ips','deny_redirect','access_mode'
+  'deny_ips','deny_redirect','access_mode','tailnet_dns'
 ];
 
 function normalize(input) {
   const r = {};
   for (const col of COLUMNS) {
     if (input[col] === undefined) continue;
-    if (['backend_tls','add_www','websocket','hsts','enabled'].includes(col)) {
+    if (['backend_tls','add_www','websocket','hsts','enabled','tailnet_dns'].includes(col)) {
       r[col] = input[col] ? 1 : 0;
     } else if (['backend_port','read_timeout'].includes(col)) {
       r[col] = Number(input[col]);
@@ -192,11 +198,11 @@ function createRule(db, input) {
     INSERT INTO rules
       (hostname, backend_host, backend_port, backend_tls, add_www,
        tls_mode, cert_path, websocket, hsts, read_timeout, enabled, notes,
-       deny_ips, deny_redirect, access_mode, created_at, updated_at)
+       deny_ips, deny_redirect, access_mode, tailnet_dns, created_at, updated_at)
     VALUES
       (@hostname, @backend_host, @backend_port, @backend_tls, @add_www,
        @tls_mode, @cert_path, @websocket, @hsts, @read_timeout, @enabled, @notes,
-       @deny_ips, @deny_redirect, @access_mode, @created_at, @updated_at)
+       @deny_ips, @deny_redirect, @access_mode, @tailnet_dns, @created_at, @updated_at)
   `);
   const res = stmt.run({
     hostname: r.hostname,
@@ -214,6 +220,7 @@ function createRule(db, input) {
     deny_ips: r.deny_ips ?? null,
     deny_redirect: r.deny_redirect ?? null,
     access_mode: r.access_mode || 'blacklist',
+    tailnet_dns: r.tailnet_dns ? 1 : 0,
     created_at: now,
     updated_at: now,
   });
@@ -233,6 +240,7 @@ function updateRule(db, id, patch) {
       cert_path=@cert_path, websocket=@websocket, hsts=@hsts,
       read_timeout=@read_timeout, enabled=@enabled, notes=@notes,
       deny_ips=@deny_ips, deny_redirect=@deny_redirect, access_mode=@access_mode,
+      tailnet_dns=@tailnet_dns,
       updated_at=@updated_at
     WHERE id=@id
   `).run({ ...merged, id });

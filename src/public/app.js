@@ -121,6 +121,18 @@ function aclBadge(rule) {
   return ` <span class="badge ${cls}" title="${n} ${word} IP/CIDR entr${n === 1 ? 'y' : 'ies'} (${whitelist ? 'allow-only' : 'block'} mode)">${icon} ${n}</span>`;
 }
 
+// Sits beside the allowlist badge because the two answer different questions
+// and are easy to conflate: that one says who is ALLOWED, this one says whether
+// the host is REACHABLE over the tailnet at all. A host can allow the whole
+// tailnet range and still be unreachable from a tailnet device, because a name
+// that resolves publicly never travels over the tailnet.
+function tailnetBadge(rule) {
+  if (!rule.tailnet_dns) return '';
+  return ' <span class="badge cert-ok" title="Reachable over Tailscale — this hostname resolves to'
+    + ' this machine\'s tailnet address for Tailscale devices; everyone else gets the public answer">'
+    + '\u27f3 tailnet</span>';
+}
+
 function certCellHtml(rule) {
   if (rule.tls_mode === 'http') return '<span class="muted">—</span>';
   const cert = state.certs[rule.hostname];
@@ -166,7 +178,7 @@ function render() {
           ${r.enabled ? 'on' : 'off'}
         </button>
       </td>
-      <td><a href="#" class="host-link" data-action="hostlog" data-host="${escapeHtml(r.hostname)}" title="View the access log for this host"><strong>${escapeHtml(r.hostname)}</strong></a>${r.add_www ? ` <span class="muted">+www</span>` : ''}${aclBadge(r)}</td>
+      <td><a href="#" class="host-link" data-action="hostlog" data-host="${escapeHtml(r.hostname)}" title="View the access log for this host"><strong>${escapeHtml(r.hostname)}</strong></a>${r.add_www ? ` <span class="muted">+www</span>` : ''}${aclBadge(r)}${tailnetBadge(r)}</td>
       <td>${escapeHtml(r.backend_host)}${r.backend_tls ? ' <span class="muted">(tls)</span>' : ''}</td>
       <td class="num">${r.backend_port}</td>
       <td>${fmtBadge(r.tls_mode, tlsBadges)}</td>
@@ -696,6 +708,7 @@ function openEditor(rule) {
     form.read_timeout.value = rule.read_timeout;
     form.enabled.checked = !!rule.enabled;
     form.deny_ips.value = rule.deny_ips || '';
+    form.tailnet_dns.checked = !!rule.tailnet_dns;
     form.deny_redirect.value = rule.deny_redirect || '';
     form.querySelector(`input[name=access_mode][value=${rule.access_mode === 'whitelist' ? 'whitelist' : 'blacklist'}]`).checked = true;
     form.notes.value = rule.notes || '';
@@ -720,6 +733,7 @@ function readForm() {
     deny_ips: f.deny_ips.value.trim() || null,
     deny_redirect: f.deny_redirect.value.trim() || null,
     access_mode: f.querySelector('input[name=access_mode]:checked').value,
+    tailnet_dns: f.tailnet_dns.checked ? 1 : 0,
     notes: f.notes.value.trim() || null,
   };
   const id = f.id.value;
@@ -896,6 +910,71 @@ function countryLabel(ip) {
   if (ip.country_code) return `${flagEmoji(ip.country_code)} ${escapeHtml(ip.country_code)}`;
   if (ip.country) return escapeHtml(ip.country);
   return '<span class="muted">…</span>';
+}
+
+// The Tailscale screen. Two columns matter and they are easy to conflate:
+// "over Tailscale" is how a host is REACHED; "who is allowed" is who gets in.
+// A host can allow the whole tailnet range and still be unreachable from a
+// tailnet device, because a publicly-resolving name never travels over the
+// tailnet at all — it goes out to the internet and arrives with an ISP address.
+function renderTsdns(d) {
+  const st = $('#ts-state');
+  const ip = d.tailscaleIp || '';
+  st.textContent = ip
+    ? `tailnet address ${ip} \u00b7 dnsmasq ${d.dnsmasqRunning ? 'running' : 'STOPPED'}`
+    : 'Tailscale is not running here \u2014 nothing can be served over the tailnet';
+  st.className = `fw-state ${ip && d.dnsmasqRunning ? 'ok' : 'bad'}`;
+
+  const dr = d.drift || {};
+  $('#ts-drift').innerHTML = dr.inSync === false
+    ? `<p class="hint" style="color:var(--bad)"><strong>Not applied.</strong> dnsmasq does not match the
+       rules${dr.unreadable ? ' (its config could not be read)' : ''}.
+       ${dr.missing && dr.missing.length ? `Ticked but not live: ${dr.missing.map((h) => `<code>${escapeHtml(h)}</code>`).join(' ')}.` : ''}
+       ${dr.extra && dr.extra.length ? `Live but no longer wanted: ${dr.extra.map((h) => `<code>${escapeHtml(h)}</code>`).join(' ')}.` : ''}
+       Press <em>Regenerate DNS</em>.</p>`
+    : '';
+
+  const domains = d.splitDnsDomains || [];
+  $('#ts-split').innerHTML = domains.length
+    ? `<p class="hint"><strong>Split DNS required.</strong> For the hosts below to resolve over the
+       tailnet, the Tailscale console needs a split-DNS entry pointing each of these domains at
+       <code>${escapeHtml(ip)}</code>: ${domains.map((x) => `<code>${escapeHtml(x)}</code>`).join(' ')}.
+       Without it, tailnet clients never ask this resolver and quietly get the public answer.</p>`
+    : '<p class="hint">No host is currently served over the tailnet.</p>';
+
+  const rows = (d.hosts || []).map((h) => {
+    const warn = h.warnOpenToAllTailnet
+      ? '<br><span class="hint">Reachable over the tailnet <em>and</em> allowing 100.64.0.0/10 \u2014 every tailnet member reaches this, staff included.</span>'
+      : '';
+    return `<tr>
+      <td><code>${escapeHtml(h.hostname)}</code>${h.enabled ? '' : ' <span class="muted">(disabled)</span>'}${warn}</td>
+      <td>${h.overTailnet ? 'yes' : '<span class="muted">no</span>'}</td>
+      <td>${h.gated ? `allowlist (${h.allowCount})` : 'open to the internet'}</td>
+    </tr>`;
+  }).join('');
+  $('#ts-hosts').innerHTML = rows
+    ? `<table class="tbl"><thead><tr><th>Host</th><th>Over Tailscale</th><th>Who is allowed</th></tr></thead><tbody>${rows}</tbody></table>`
+    : '<p class="muted">No rules yet.</p>';
+
+  if (d.lastApply) {
+    $('#ts-hosts').insertAdjacentHTML('beforeend',
+      `<p class="hint">Last DNS apply: ${escapeHtml(d.lastApply.status)} \u2014 ${escapeHtml(d.lastApply.message || '')}</p>`);
+  }
+}
+
+async function loadTsdns() {
+  showError('');
+  try { renderTsdns(await api('GET', '/tsdns')); }
+  catch (e) { showError(e.message); }
+}
+
+async function onTsdnsApply() {
+  showError('');
+  try {
+    const r = await api('POST', '/tsdns/apply');
+    if (r.status !== 'ok') showError(r.message || 'DNS apply failed');
+  } catch (e) { showError(e.message); }
+  loadTsdns();
 }
 
 function switchView(view) {
@@ -1972,6 +2051,8 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#nav-blocklist').addEventListener('click', () => switchView('blocklist'));
   $('#nav-firewall').addEventListener('click', () => switchView('firewall'));
   $('#nav-breach').addEventListener('click', () => switchView('breach'));
+  $('#nav-tsdns').addEventListener('click', () => switchView('tsdns'));
+  $('#ts-apply').addEventListener('click', onTsdnsApply);
   $('#breach-refresh').addEventListener('click', () => loadBreach());
   $('#breach-window').addEventListener('change', () => loadBreach());
   $('#breach-panels').addEventListener('click', onExplainClick);

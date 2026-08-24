@@ -2,14 +2,15 @@ const path = require('node:path');
 const express = require('express');
 const db = require('./db');
 const auth = require('./auth');
-const { caddyHealthy } = require('./caddy');
-const { reloadCaddy, scheduleMaintenanceAutoEnd } = require('./sync');
+const { caddyHealthy, DEFAULT_BLOCK_ACTION_PATH } = require('./caddy');
+const { reloadCaddy, scheduleMaintenanceAutoEnd, seedBlockAction } = require('./sync');
 const { startIngester } = require('./access-log');
 const breach = require('./breach');
 const notify = require('./notify');
 const rulesRoute = require('./routes/rules');
 const systemRoute = require('./routes/system');
 const activityRoute = require('./routes/activity');
+const tsdnsRoute = require('./routes/tsdns');
 const blockActionRoute = require('./routes/blockAction');
 const blockToken = require('./blockToken');
 const authRoute = require('./routes/auth');
@@ -18,10 +19,42 @@ const firewallRoute = require('./routes/firewall');
 const PORT = Number(process.env.PORT || 8080);
 const BIND = process.env.BIND || '0.0.0.0';
 
+// What a tapped Block button reports back. The notification action gives the
+// phone no visible answer, so the outcome returns as its own push — see the
+// note in routes/blockAction.js. Reads the environment per call so it picks up
+// the same NTFY_* the breach watcher uses.
+function pushBlockOutcome({ title, body, priority, tags }) {
+  const topic = (process.env.NTFY_TOPIC || '').trim();
+  if (!topic) return Promise.resolve({ sent: false, reason: 'ntfy topic is not configured' });
+  return notify.send({ title, body, priority, tags }, {
+    topic,
+    server: process.env.NTFY_SERVER || notify.DEFAULT_SERVER,
+    token: process.env.NTFY_TOKEN || '',
+  });
+}
+
 const database = db.open();
 auth.ensureAuthSeed(database);
+// Copy BLOCK_ACTION_* into the database so every later reload republishes the
+// block route, including reloads from processes that never had those variables
+// in their environment. The unit file is still where they are set.
+seedBlockAction(database);
 const app = express();
 
+// The notification block button. Deliberately mounted BEFORE requireAuth: it is
+// tapped from a phone with no panel session, and its authorisation is a signed
+// single-IP token instead (see routes/blockAction.js). Caddy publishes exactly
+// this one prefix on one hostname, from the same BLOCK_ACTION_PATH value, so
+// nothing else the panel serves is reachable from the internet alongside it.
+//
+// Also mounted BEFORE the body parsers. Everything this route needs is in the
+// URL, and it is the one route reachable from the internet — parsing up to a
+// megabyte of attacker-chosen JSON before deciding the token is forged is work
+// nobody should be able to make us do.
+app.use(DEFAULT_BLOCK_ACTION_PATH, blockActionRoute.buildRouter(database, {
+  secret: () => blockToken.secretFor(database),
+  confirm: pushBlockOutcome,
+}));
 // Restore uploads bundle every rule + embedded manual certs, so give that
 // one endpoint a larger ceiling. Mounted first so the per-route parser sets
 // req._body and the general parser below skips re-parsing. Guarded by
@@ -32,13 +65,6 @@ app.use(express.json({ limit: '1mb' }));
 // Auth router is public (its routes self-guard); everything else under /api
 // requires a valid session. Static files stay public — they hold no secrets.
 app.use('/api/auth', authRoute.buildRouter(database));
-// The notification block button. Deliberately mounted BEFORE requireAuth: it is
-// tapped from a phone with no panel session, and its authorisation is a signed
-// single-IP token instead (see routes/blockAction.js). It is published on its
-// own hostname so nothing else under /api is exposed with it.
-app.use('/api/block', blockActionRoute.buildRouter(database, {
-  secret: () => blockToken.secretFor(database),
-}));
 app.use('/api', auth.requireAuth(database));
 // Until the default admin/admin password is changed, block privileged and
 // secret-exposing endpoints (rule/firewall edits, self-update, restore, backup,
@@ -49,6 +75,8 @@ app.use('/api/rules', rulesRoute.buildRouter(database));
 app.use('/api/system/firewall', firewallRoute.buildRouter());
 app.use('/api/system', systemRoute.buildRouter(database));
 app.use('/api/activity', activityRoute.buildRouter(database));
+// Which hosts resolve to the tailnet address, and how each one is reachable.
+app.use('/api/tsdns', tsdnsRoute.buildRouter(database));
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use((err, req, res, next) => {
@@ -131,11 +159,17 @@ function startBreachWatcher(database) {
         // BLOCK_ACTION_HOST is what publishes the endpoint through Caddy. With
         // no host there is nothing reachable to point a button at, so the button
         // is absent rather than broken.
-        pathsFor: (ip) => breach.pathsForIp(database, ip, { hours: 1, limit: 8 }),
+        // Fetch well past what the message shows: notify.js caps the list at 12,
+        // and the "…and N more" line is only honest if the rows behind the cap
+        // were actually counted. Refused paths are fetched too — they sort after
+        // served ones and are filtered out of the message, but they are what
+        // makes the count mean anything.
+        pathsFor: (ip) => breach.pathsForIp(database, ip, { hours: 1, limit: 60 }),
         blockUrlFor: (ip) => {
           const host = (process.env.BLOCK_ACTION_HOST || '').trim();
           if (!host) return '';
-          return `https://${host}/api/block/${blockToken.mint(ip, { secret: blockToken.secretFor(database) })}`;
+          const token = blockToken.mint(ip, { secret: blockToken.secretFor(database) });
+          return `https://${host}${DEFAULT_BLOCK_ACTION_PATH}/${token}`;
         },
         onError: (ip, reason) => console.error(`[rproxy-ui] breach alert for ${ip} failed: ${reason}`),
       });

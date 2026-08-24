@@ -1,12 +1,29 @@
 const express = require('express');
 const db = require('../db');
 const { reloadCaddy } = require('../sync');
+const tsdns = require('../tailnetDns');
+const tsdnsRoute = require('./tsdns');
 
 function buildRouter(database) {
   const r = express.Router();
 
   async function reloadFromDb() {
     const { rules } = await reloadCaddy(database);
+    // Regenerate the tailnet DNS overrides from the same rules, so the two can
+    // never disagree about which hosts are reachable over Tailscale. Best
+    // effort: a DNS helper problem must not block a Caddy reload, and it is
+    // reported on the tailnet screen rather than swallowed.
+    try {
+      // db.listRules, NOT reloadCaddy's return: that resolves to
+      // { rules: <count> }, so passing it here handed a number to something
+      // expecting an array and the regeneration silently did nothing.
+      const conf = tsdns.renderDnsmasqConf(
+        db.listRules(database), { tailscaleIp: tsdnsRoute.tailscaleIp() });
+      require('fs').writeFileSync(
+        process.env.TSDNS_ACTION_FILE || '/var/lib/rproxy/.tsdns-action', conf, { mode: 0o640 });
+    } catch (e) {
+      console.warn(`[rproxy-ui] tailnet DNS regeneration skipped: ${e.message}`);
+    }
     return rules;
   }
 

@@ -30,6 +30,7 @@
       <button id="nav-blocklist" class="nav-btn">Blocklist</button>
       <button id="nav-firewall" class="nav-btn">Firewall</button>
       <button id="nav-breach" class="nav-btn">Breach</button>
+      <button id="nav-tsdns" class="nav-btn">Tailscale</button>
     </nav>
     <div class="status" id="status">…</div>
     <input type="search" id="search" class="search rules-only" placeholder="Filter — try *.com or api* or 3001"
@@ -182,6 +183,23 @@
       <div id="breach-panels"></div>
     </div>
 
+    <div id="view-tsdns" hidden>
+      <div class="activity-toolbar">
+        <span id="ts-state" class="fw-state">…</span>
+        <button id="ts-apply">Regenerate DNS</button>
+      </div>
+      <p class="hint">
+        How each host can be <strong>reached</strong>, which is a different question from who is
+        <strong>allowed</strong>. Tailscale carries only traffic addressed to <code>100.x</code>, so a
+        host that resolves publicly is reached over the ordinary internet even by a device that is on
+        the tailnet — arriving with its ISP address, which an allowlist of tailnet addresses then
+        refuses. A host is reachable over Tailscale only when it appears below with that column set.
+      </p>
+      <div id="ts-drift"></div>
+      <div id="ts-split"></div>
+      <div id="ts-hosts"></div>
+    </div>
+
     <div id="view-firewall" hidden>
       <div class="activity-toolbar">
         <span id="fw-state" class="fw-state">…</span>
@@ -277,13 +295,26 @@
         <legend>IP access control</legend>
         <label><input type="radio" name="access_mode" value="blacklist" checked> Blacklist — block the listed IPs, allow everyone else</label>
         <label><input type="radio" name="access_mode" value="whitelist"> Whitelist — allow ONLY the listed IPs, block everyone else</label>
-        <label>IPs / CIDRs
+        <label class="stack">IPs / CIDRs
           <textarea name="deny_ips" rows="3" placeholder="One per line — e.g.&#10;203.0.113.0/24&#10;198.51.100.7   # office&#10;2001:db8::/32"></textarea>
         </label>
-        <label>Redirect rejected visitors to
+        <label class="stack">Redirect rejected visitors to
           <input name="deny_redirect" placeholder="https://example.com/blocked — leave empty for a plain 403">
         </label>
         <span class="hint">Real visitor IP is used even behind Cloudflare. <code>#</code> starts a comment. An <strong>empty list disables access control</strong> regardless of mode.</span>
+      </fieldset>
+
+      <fieldset>
+        <legend>Tailscale</legend>
+        <label><input type="checkbox" name="tailnet_dns"> Reachable over Tailscale</label>
+        <span class="hint">
+          Points this hostname at this machine's tailnet address <em>for Tailscale devices only</em>;
+          everyone else keeps the public answer. Being on the tailnet is not enough on its own —
+          Tailscale only carries traffic addressed to <code>100.x</code>, so without this a tailnet
+          device still reaches the site over the public internet and arrives with its ISP address.
+          Needs a split-DNS entry for the domain in the Tailscale console; the
+          <a href="#" data-nav="tsdns">Tailscale screen</a> lists which.
+        </span>
       </fieldset>
 
       <label>Notes

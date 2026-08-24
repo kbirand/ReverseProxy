@@ -227,6 +227,11 @@ fieldset {
 }
 fieldset legend { color: var(--muted); font-size: 12px; padding: 0 6px; }
 fieldset label { color: var(--text); font-size: 13px; flex-direction: row; align-items: center; gap: 6px; }
+/* Row direction suits a checkbox and its caption, but a label wrapping a
+   textarea ends up sharing the row with its own label text, leaving the
+   control a narrow column. Stack those and let the control fill the box. */
+fieldset label.stack { flex-direction: column; align-items: stretch; gap: 4px; }
+fieldset label.stack textarea, fieldset label.stack input { width: 100%; box-sizing: border-box; }
 .row { display: flex; gap: 10px; align-items: flex-end; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
