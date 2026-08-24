@@ -42,6 +42,35 @@ const DEFAULT_BLOCK_ACTION_HOST = (process.env.BLOCK_ACTION_HOST || '').trim();
 const DEFAULT_BLOCK_ACTION_UPSTREAM = (process.env.BLOCK_ACTION_UPSTREAM
   || '127.0.0.1:8080').trim();
 
+// The published hostname is one that already serves a site, because a dedicated
+// subdomain would announce itself: a certificate for it appears in the public
+// Certificate Transparency logs minutes after issue, and crt.sh turns that into
+// a list. Reusing a hostname that already holds a certificate adds no new entry.
+//
+// That puts the endpoint on a host scanners already touch, so the path prefix
+// carries the hiding instead — set BLOCK_ACTION_PATH to something unguessable.
+// This is noise reduction, NOT a security boundary: the URL crosses ntfy and
+// lands on a lock screen, so treat the path as unpublished rather than secret.
+// The signature on the token is the boundary.
+//
+// server.js mounts the express router on the same prefix from this same value,
+// so the two cannot drift — a mismatch would 404 every button silently.
+const BLOCK_PATH_RE = /^\/[A-Za-z0-9/_.-]*$/;
+function normalizeBlockPath(raw) {
+  const trimmed = String(raw == null ? '' : raw).trim().replace(/\/+$/, '');
+  if (!trimmed) return '/api/block';
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  // A prefix carrying a glob, a space or a query would build a matcher that
+  // does not mean what it reads. Refusing at startup would take the proxy down
+  // over a typo in an env file, so fall back loudly instead.
+  if (!BLOCK_PATH_RE.test(withSlash)) {
+    console.warn(`[rproxy-ui] BLOCK_ACTION_PATH ${JSON.stringify(raw)} is not a plain path; using /api/block`);
+    return '/api/block';
+  }
+  return withSlash;
+}
+const DEFAULT_BLOCK_ACTION_PATH = normalizeBlockPath(process.env.BLOCK_ACTION_PATH);
+
 const DEFAULT_FALLBACK_CLIENT_IPS = (process.env.FALLBACK_CLIENT_IPS
   || '127.0.0.1/32,::1/128')
   .split(',').map((s) => s.trim()).filter(Boolean);
@@ -494,6 +523,31 @@ function denyHandler(blockPage) {
   };
 }
 
+// A block token rides in the URL path, and Caddy logs the full URI — so every
+// tap would write a still-valid credential into the access log and, from there,
+// into the access_events table the activity view renders. The token only ever
+// blocks the one IP it names, but it should not outlive its tap on disk, and
+// the path prefix is meant to stay out of anything that gets shipped or backed
+// up. Strip the token at the encoder, before it reaches the file.
+function accessLogEncoder(blockActionPath) {
+  const json = { format: 'json' };
+  if (!blockActionPath) return json;
+  const escaped = blockActionPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return {
+    format: 'filter',
+    wrap: json,
+    fields: {
+      'request>uri': {
+        filter: 'regexp',
+        regexp: `^(${escaped}/).*$`,
+        // ${1} rather than $1: the replacement is followed by a letter, and Go
+        // would read $1redacted as a capture group named "1redacted".
+        value: '${1}[redacted]',
+      },
+    },
+  };
+}
+
 function renderConfig(rules, opts = {}) {
   const fallbackUpstream = opts.fallbackUpstream !== undefined
     ? opts.fallbackUpstream : DEFAULT_FALLBACK_UPSTREAM;
@@ -519,6 +573,56 @@ function renderConfig(rules, opts = {}) {
     };
     httpRoutes.push(blockRoute);
     httpsRoutes.push(blockRoute);
+  }
+
+  // The notification "block this source" button, published on a hostname that
+  // already serves a site. Ordering is the whole trick here:
+  //
+  //   * after the global blocklist — a source you have already blocked gets
+  //     nothing, this endpoint included.
+  //   * before maintenance, because this proxies to the panel and not to the
+  //     site's backend. A security button that goes dead during a maintenance
+  //     window is a button you cannot rely on at the moment you need it.
+  //   * before the per-rule routes, and this is the one that bites: a rule's
+  //     route matches on hostname ALONE and is terminal, so on a host that has
+  //     a rule it swallows the button and hands it to that site's backend. Any
+  //     ACL route for the rule is also skipped, deliberately — the phone
+  //     tapping this is not in a site's IP whitelist.
+  //
+  // POST only: a GET would let any link preview, crawler or chat client that
+  // unfurls the URL block an address without anyone tapping anything.
+  //
+  // On :80 as well as :443. The minted URL is https://, so the phone-to-edge
+  // leg is TLS either way; :80 is there because a Cloudflare "Flexible" zone
+  // re-originates as plain HTTP, and dropping it would 404 the button on every
+  // CF-fronted host (same reason the redirect below stays disabled).
+  const blockActionHost = opts.blockActionHost === undefined
+    ? DEFAULT_BLOCK_ACTION_HOST : opts.blockActionHost;
+  const blockActionUpstream = opts.blockActionUpstream || DEFAULT_BLOCK_ACTION_UPSTREAM;
+  const blockActionPath = opts.blockActionPath === undefined
+    ? DEFAULT_BLOCK_ACTION_PATH : normalizeBlockPath(opts.blockActionPath);
+  if (blockActionHost) {
+    const blockActionRoute = {
+      match: [{ host: [blockActionHost], path: [`${blockActionPath}/*`], method: ['POST'] }],
+      handle: [
+        // The panel sits behind this proxy, so express sees every request
+        // coming from loopback and cannot rate-limit per source on its own.
+        // {http.vars.client_ip} is Caddy's RESOLVED address: it honours
+        // trusted_proxies, so behind Cloudflare it is the real visitor rather
+        // than a CF edge node. Not {http.request.remote.host}, which is the
+        // immediate peer, and not {http.request.client_ip}, which reads like
+        // the right name but is not a placeholder Caddy defines — it survives
+        // into the header verbatim, which would key every source alike.
+        {
+          handler: 'headers',
+          request: { set: { 'X-Block-Client-Ip': ['{http.vars.client_ip}'] } },
+        },
+        { handler: 'reverse_proxy', upstreams: [{ dial: blockActionUpstream }] },
+      ],
+      terminal: true,
+    };
+    httpRoutes.push(blockActionRoute);
+    httpsRoutes.push(blockActionRoute);
   }
 
   // Maintenance mode: short-circuit a chosen set of hostnames (or every enabled
@@ -579,22 +683,6 @@ function renderConfig(rules, opts = {}) {
   // and those requests get the clean 404 below, same as any unknown host.
   const fallbackHosts = opts.fallbackHosts || DEFAULT_FALLBACK_HOSTS;
   const fallbackClientIps = opts.fallbackClientIps || DEFAULT_FALLBACK_CLIENT_IPS;
-  const blockActionHost = opts.blockActionHost === undefined
-    ? DEFAULT_BLOCK_ACTION_HOST : opts.blockActionHost;
-  const blockActionUpstream = opts.blockActionUpstream || DEFAULT_BLOCK_ACTION_UPSTREAM;
-  if (blockActionHost) {
-    // POST only: a GET here would let any link preview, crawler or chat client
-    // that unfurls the URL block an address without anyone tapping anything.
-    // On :443 as well as :80 — the token is a credential and must not cross the
-    // internet in clear, and the notification action is an https:// URL.
-    const blockActionRoute = {
-      match: [{ host: [blockActionHost], path: ['/api/block/*'], method: ['POST'] }],
-      handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: blockActionUpstream }] }],
-      terminal: true,
-    };
-    httpRoutes.push(blockActionRoute);
-    httpsRoutes.push(blockActionRoute);
-  }
   if (fallbackUpstream && fallbackHosts.length) {
     httpRoutes.push({
       match: [{ host: fallbackHosts, client_ip: { ranges: fallbackClientIps } }],
@@ -635,6 +723,15 @@ function renderConfig(rules, opts = {}) {
   // per-rule IP blocklists) resolves the real visitor IP from X-Forwarded-For.
   const trustedProxies = { source: 'static', ranges: CLOUDFLARE_IPS };
 
+  // Cf-Connecting-Ip, not X-Forwarded-For. Caddy defaults to XFF, which the
+  // client can write: a scanner sent `X-Forwarded-For: 127.0.0.1,<real>` and
+  // was recorded AS 127.0.0.1 — an address every allowlist and the breach
+  // logic treat as internal. That is an outright source-IP spoof. Cloudflare
+  // strips any inbound Cf-Connecting-Ip and sets its own, so behind CF it is
+  // authoritative; with trusted_proxies above, a direct-to-origin attacker's
+  // forged copy is ignored because their hop is not a trusted proxy.
+  const clientIpHeaders = ['Cf-Connecting-Ip'];
+
   // `logs: {}` enables per-server access logging to logger
   // `http.log.access.<server>`, which the `access` log below captures to file.
   const servers = {
@@ -642,6 +739,7 @@ function renderConfig(rules, opts = {}) {
       listen: [':80'],
       routes: httpRoutes,
       trusted_proxies: trustedProxies,
+      client_ip_headers: clientIpHeaders,
       logs: {},
       automatic_https: { disable_redirects: true },
     },
@@ -652,6 +750,7 @@ function renderConfig(rules, opts = {}) {
       listen: [':443'],
       routes: httpsRoutes,
       trusted_proxies: trustedProxies,
+      client_ip_headers: clientIpHeaders,
       logs: {},
     };
     if (tlsConnPolicies.length) {
@@ -687,7 +786,7 @@ function renderConfig(rules, opts = {}) {
             roll_keep: 3,
             mode: '0640',
           },
-          encoder: { format: 'json' },
+          encoder: accessLogEncoder(blockActionHost ? blockActionPath : ''),
           include: accessNamespaces,
           level: 'INFO',
         },
@@ -756,4 +855,6 @@ module.exports = {
   DEFAULT_ACCESS_LOG,
   DEFAULT_ADMIN,
   DEFAULT_FALLBACK_CLIENT_IPS,
+  DEFAULT_BLOCK_ACTION_PATH,
+  normalizeBlockPath,
 };

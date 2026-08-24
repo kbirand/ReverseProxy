@@ -413,3 +413,116 @@ test('no block-action host means no public route at all', () => {
   const blob = JSON.stringify(cfg);
   assert.ok(!blob.includes('/api/block/'), 'the endpoint stays private unless deliberately published');
 });
+
+// The endpoint is published on a hostname that ALREADY serves a site, because a
+// dedicated subdomain announces itself in the Certificate Transparency logs the
+// moment it is issued a certificate. That makes route order load-bearing: a
+// rule's route matches on hostname alone and is terminal.
+const SHARED_HOST = 'lab.example.com';
+const HIDDEN_PATH = '/z7k3m9x2q1v8';
+const BLOCK_OPTS = {
+  blockActionHost: SHARED_HOST,
+  blockActionUpstream: '127.0.0.1:8080',
+  blockActionPath: HIDDEN_PATH,
+};
+
+function indexOfBlockRoute(routes) {
+  return routes.findIndex((r) => JSON.stringify(r).includes(`${HIDDEN_PATH}/*`));
+}
+
+test('the block route outranks the rule that already serves its hostname', () => {
+  const cfg = renderConfig(
+    [{ ...baseRule, hostname: SHARED_HOST, tls_mode: 'letsencrypt' }],
+    BLOCK_OPTS,
+  );
+  for (const name of ['srv_http', 'srv_https']) {
+    const routes = cfg.apps.http.servers[name].routes;
+    const block = indexOfBlockRoute(routes);
+    const rule = routes.findIndex((r) => r.match && r.match[0].host
+      && r.match[0].host.includes(SHARED_HOST)
+      && r.handle.some((h) => h.handler === 'reverse_proxy' && JSON.stringify(h).includes('3000')));
+    assert.ok(block >= 0, `${name}: the block route must exist`);
+    assert.ok(rule >= 0, `${name}: the site's own route must still exist`);
+    assert.ok(block < rule,
+      `${name}: the rule route matches the host alone and is terminal — behind it the button reaches the site's backend, not the panel`);
+  }
+});
+
+test('the block route survives a maintenance window on its own hostname', () => {
+  const cfg = renderConfig(
+    [{ ...baseRule, hostname: SHARED_HOST, tls_mode: 'letsencrypt' }],
+    { ...BLOCK_OPTS, maintenance: { active: true, hosts: [SHARED_HOST], until: null } },
+  );
+  const routes = cfg.apps.http.servers.srv_https.routes;
+  const block = indexOfBlockRoute(routes);
+  const maint = routes.findIndex((r) => r.handle.some((h) => h.handler === 'static_response'
+    && h.status_code === 503));
+  assert.ok(block >= 0 && maint >= 0);
+  assert.ok(block < maint,
+    'this proxies to the panel, not the site backend — a block button that dies during maintenance is one you cannot rely on');
+});
+
+test('a globally blocked source cannot reach the block endpoint either', () => {
+  const cfg = renderConfig([], { ...BLOCK_OPTS, globalBlocks: ['203.0.113.9'] });
+  const routes = cfg.apps.http.servers.srv_https.routes;
+  const deny = routes.findIndex((r) => r.match && r.match[0].client_ip);
+  assert.ok(deny >= 0 && deny < indexOfBlockRoute(routes));
+});
+
+test('the published path is the configured one, not a guessable default', () => {
+  const cfg = renderConfig([], BLOCK_OPTS);
+  const blob = JSON.stringify(cfg);
+  assert.ok(blob.includes(`${HIDDEN_PATH}/*`), 'the hidden prefix is what gets published');
+  assert.ok(!blob.includes('/api/block/*'), 'and the default prefix is not published alongside it');
+});
+
+test('a path prefix that is not a plain path falls back rather than building a wrong matcher', () => {
+  const cfg = renderConfig([], { ...BLOCK_OPTS, blockActionPath: '/oops/*?x=1' });
+  assert.ok(JSON.stringify(cfg).includes('/api/block/*'));
+});
+
+test('Caddy hands the resolved client IP to the panel for rate limiting', () => {
+  const cfg = renderConfig([], BLOCK_OPTS);
+  const routes = cfg.apps.http.servers.srv_https.routes;
+  const route = routes[indexOfBlockRoute(routes)];
+  const headers = route.handle.find((h) => h.handler === 'headers');
+  assert.ok(headers, 'without this express sees only loopback and cannot tell sources apart');
+  assert.deepEqual(headers.request.set['X-Block-Client-Ip'], ['{http.vars.client_ip}']);
+  assert.ok(route.handle.indexOf(headers) < route.handle.findIndex((h) => h.handler === 'reverse_proxy'),
+    'the header has to be set before the request is proxied');
+});
+
+test('the access log keeps the token out of the file', () => {
+  const cfg = renderConfig([], BLOCK_OPTS);
+  const enc = cfg.logging.logs.access.encoder;
+  assert.equal(enc.format, 'filter');
+  assert.equal(enc.wrap.format, 'json');
+  const f = enc.fields['request>uri'];
+  assert.equal(f.filter, 'regexp');
+  assert.match(f.value, /redacted/);
+  // The pattern must actually match a real request line, escaping and all.
+  assert.match(`${HIDDEN_PATH}/abc.def`, new RegExp(f.regexp));
+  assert.doesNotMatch('/some/other/path', new RegExp(f.regexp));
+});
+
+test('no block host means the log encoder stays plain json', () => {
+  const cfg = renderConfig([], {});
+  assert.deepEqual(cfg.logging.logs.access.encoder, { format: 'json' });
+});
+
+// A scanner sent `X-Forwarded-For: 127.0.0.1,<real-ip>` and Caddy trusted the
+// forged left-most value, recording the client as 127.0.0.1 — an address the
+// breach logic and every allowlist treat as internal. XFF is client-writable;
+// Cloudflare's Cf-Connecting-Ip is not (CF strips any inbound copy and sets its
+// own). Reading client_ip from that header instead closes the spoof: behind CF
+// it is authoritative, and a direct-to-origin attacker's copy is ignored because
+// their connection is not from a trusted proxy.
+test('client_ip is read from Cf-Connecting-Ip, not the spoofable XFF', () => {
+  const cfg = renderConfig([{ ...baseRule, tls_mode: 'letsencrypt' }]);
+  for (const name of ['srv_http', 'srv_https']) {
+    const s = cfg.apps.http.servers[name];
+    assert.deepEqual(s.client_ip_headers, ['Cf-Connecting-Ip'],
+      `${name} must derive client_ip from the unspoofable header`);
+    assert.ok(s.trusted_proxies, `${name} still trusts only Cloudflare's ranges`);
+  }
+});
