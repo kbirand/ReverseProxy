@@ -135,7 +135,7 @@ function buildMessage(row, opts = {}) {
       '',
       `Source: ${row.client_ip}${who}`,
       `Host:   ${row.top_host || 'multiple'}`,
-      `Volume: ${row.requests} requests · ${mb(row.bytes)}`,
+      `Volume: ${row.requests} requests · ${mb(row.bytes)}${row.peak_rate ? ` · ${row.peak_rate}/s peak` : ''}`,
       `Served: real ${row.real} · refused ${row.failures}`,
       ...endpointLines(opts.paths),
       ...probedLines(opts.paths),

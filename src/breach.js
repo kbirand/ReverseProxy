@@ -336,10 +336,13 @@ function verdictFor(r, allowlisted) {
     // reported as an intruder. Anything the server actually answered — real,
     // shell, blocked, unknown — counts as answered; what is left is the 404s.
     // On real traffic that ratio is 99% for a scanner and 16% for a client.
-    const answered = (r.real || 0) + (r.shell || 0) + (r.blocked || 0) + (r.unknown || 0);
-    const unanswered = Math.max(0, r.requests - answered);
-    const mostlyUnanswered = r.requests > 0 && unanswered / r.requests >= 0.6;
-    if (mostlyUnanswered || r.probes >= 20) {
+    // What marks a scan is how often the server said "no such thing" — 4xx/5xx.
+    // NOT "requests minus 2xx": that counted a warm browser cache's 304s as
+    // refusals, so a person revisiting the portfolio in Safari read as a scan.
+    // A human browsing gets 2xx and 304; a scanner gets a wall of 404s.
+    const rejected = r.rejected || 0;
+    const mostlyRejected = r.requests > 0 && rejected / r.requests >= 0.6;
+    if (mostlyRejected || r.probes >= 20) {
       return {
         level: 'watch',
         text: `Automated scan — ${r.requests} requests across ${r.distinct_paths} paths, and `
@@ -394,6 +397,11 @@ function ipSummary(db, opts = {}) {
            COUNT(DISTINCT host) AS hosts,
            COALESCE(SUM(size), 0) AS bytes,
            SUM(CASE WHEN status IN (401, 403) THEN 1 ELSE 0 END) AS failures,
+           -- 4xx/5xx: the server said "no such thing" or errored. This is the
+           -- true scanner signal. A person browsing gets 2xx and 304 (cache);
+           -- a scanner gets a wall of 404s. Counting on 2xx-only "answered"
+           -- wrongly treated a warm cache's 304s as refusals.
+           SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS rejected,
            SUM(suspicious_path) AS probes,
            MIN(ts) AS first_ts, MAX(ts) AS last_ts
     FROM access_events
@@ -427,6 +435,20 @@ function ipSummary(db, opts = {}) {
     m.byHost[b.host] = (m.byHost[b.host] || 0) + b.bytes;
   }
 
+  // Peak requests in any single second, per IP — the honest "40/s" figure.
+  // An average over the active window hides a burst; this does not. One grouped
+  // pass: count per (ip, second), then take each ip's busiest second.
+  const peak = {};
+  for (const b of db.prepare(`
+    SELECT client_ip, MAX(cnt) AS peak_rate FROM (
+      SELECT client_ip, ts / 1000 AS sec, COUNT(*) AS cnt
+      FROM access_events WHERE ts >= ?
+      GROUP BY client_ip, sec
+    ) GROUP BY client_ip
+  `).all(from)) {
+    peak[b.client_ip] = b.peak_rate;
+  }
+
   const info = require('./db').getIpInfoMany(db, base.map((r) => r.client_ip));
   return base.map((r) => {
     const t = tally[r.client_ip] || { real: 0, blocked: 0, shell: 0, unknown: 0, real_sensitive: 0 };
@@ -444,6 +466,7 @@ function ipSummary(db, opts = {}) {
       content,
       top_host: topHost ? topHost[0] : null,
       protected_top_host: topHost ? acl.has(topHost[0]) : false,
+      peak_rate: peak[r.client_ip] || 0,
     };
     row.verdict = verdictFor(row, inAllowlist(r.client_ip, allow));
     return row;
@@ -545,7 +568,7 @@ function formatForHandoff({ row, paths = [], explanation = null, hours = 24 }) {
   L.push(`Window:    last ${hours} h`);
   L.push(`Active:    ${fmtTime(row.first_ts)} → ${fmtTime(row.last_ts)} UTC`);
   L.push(`Verdict:   ${String(row.verdict.level).toUpperCase()} — ${row.verdict.text}`);
-  L.push(`Volume:    ${row.requests} requests · ${fmtBytes(row.bytes)} · ${row.distinct_paths} distinct paths · ${row.hosts} hosts`);
+  L.push(`Volume:    ${row.requests} requests · ${fmtBytes(row.bytes)} · ${row.distinct_paths} distinct paths · ${row.hosts} hosts${row.peak_rate ? ` · ${row.peak_rate}/s peak` : ''}`);
   L.push(`Received:  real ${row.real} · blocked ${row.blocked} · shell ${row.shell} · unknown ${row.unknown} · ${row.failures} refused`);
   if (row.content) {
     L.push(`Content:   media ${pct(row.content.media)}% · api ${pct(row.content.api)}% · archive ${pct(row.content.archive)}% · code ${pct(row.content.code)}% · other ${pct(row.content.other)}%`);

@@ -382,7 +382,9 @@ function renderBreach(rep) {
       return `<tr class="${r.explanation ? 'has-explanation' : ''}" data-verdict="${lv}">`
         + `<td><span class="vd vd-${lv}" title="${escapeHtml(help)}">${lab}</span></td>`
         + `<td><code>${escapeHtml(r.client_ip)}</code>${r.label ? `<span class="muted">${escapeHtml(r.label)}</span>` : ''}</td>`
-        + `<td>${r.requests} reqs · ${bytesH(r.bytes)}<span class="muted">`
+        + `<td>${r.requests} reqs · ${bytesH(r.bytes)}`
+        + (r.peak_rate >= 5 ? ` · <strong>${r.peak_rate}/s peak</strong>` : (r.peak_rate ? ` · ${r.peak_rate}/s peak` : ''))
+        + `<span class="muted">`
         + `real ${r.real} · blocked ${r.blocked} · shell ${r.shell} · unknown ${r.unknown} · ${r.failures} refused</span></td>`
         + `<td>${escapeHtml(r.verdict.text)}`
         + `</td>`

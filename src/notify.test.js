@@ -290,3 +290,9 @@ test('no detail url means only the Block action, as before', () => {
   const msg = notify.buildMessage(row, { blockUrl: 'https://link.example.com/b/TOK' });
   assert.doesNotMatch(msg.actions || '', /Details/);
 });
+
+test('the peak per-second rate appears on the Volume line', () => {
+  const row = { client_ip: '203.0.113.7', top_host: 'h', requests: 43, bytes: 4300,
+    real: 0, failures: 43, peak_rate: 40, verdict: { level: 'watch', text: 'scan' } };
+  assert.match(notify.buildMessage(row, {}).body, /Volume: 43 requests · 0 MB · 40\/s peak/);
+});

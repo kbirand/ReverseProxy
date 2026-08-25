@@ -776,3 +776,81 @@ test('shell responses count as answered — the server did reply', () => {
   const v = breach.verdictFor(row({ requests: 200, distinct_paths: 100, real: 10, shell: 180 }), false);
   assert.notEqual(v.level, 'watch');
 });
+
+// Rate separates a hammering scanner from a slow trickle, and an AVERAGE hides
+// it: 40 requests fired in one second then a minute's pause averages to well
+// under 1/s. The panel now reports the PEAK — the busiest single second — which
+// is what "40 requests a second" actually means.
+test('ipSummary reports the peak per-second request rate', () => {
+  const d = db.open(':memory:');
+  const base = Date.now();
+  const rows = [];
+  // 40 requests inside one second, then 3 stragglers spread over the next minute
+  for (let i = 0; i < 40; i++) {
+    rows.push({ ts: base, client_ip: '203.0.113.7', host: 'h', method: 'GET',
+      uri: `/p${i}`, status: 404, user_agent: 'u', suspicious_path: 1, size: 100 });
+  }
+  for (let i = 0; i < 3; i++) {
+    rows.push({ ts: base + (i + 1) * 20000, client_ip: '203.0.113.7', host: 'h', method: 'GET',
+      uri: `/q${i}`, status: 404, user_agent: 'u', suspicious_path: 1, size: 100 });
+  }
+  db.insertAccessEvents(d, rows);
+  const r = breach.ipSummary(d, { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '203.0.113.7');
+  assert.equal(r.peak_rate, 40, 'the busiest second, not the ~0.7/s average');
+});
+
+test('a slow trickle has a low peak rate', () => {
+  const d = db.open(':memory:');
+  const base = Date.now();
+  const rows = [];
+  for (let i = 0; i < 10; i++) {
+    rows.push({ ts: base + i * 30000, client_ip: '203.0.113.8', host: 'h', method: 'GET',
+      uri: '/', status: 200, user_agent: 'u', suspicious_path: 0, size: 100 });
+  }
+  db.insertAccessEvents(d, rows);
+  const r = breach.ipSummary(d, { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '203.0.113.8');
+  assert.equal(r.peak_rate, 1, 'one request in any given second');
+});
+
+// A person revisiting the portfolio in Safari with a warm cache: 40 requests,
+// 11 fresh 2xx and ~29 304s (use-your-cache). The old heuristic counted "requests
+// minus 2xx" as refused, so those 304s made it read as an automated scan — the
+// verdict even contradicted its own AI assessment. A 304 is the server ANSWERING;
+// what marks a scan is 4xx (no such thing).
+test('a warm-cache browsing session is not a scan', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  for (let i = 0; i < 11; i++) {
+    rows.push({ ts: now, client_ip: '198.51.100.20', host: 'www.example.com', method: 'GET',
+      uri: `/gallery/img${i}.jpg`, status: 200, user_agent: 'Safari', suspicious_path: 0, size: 40000 + i * 1234 });
+  }
+  for (let i = 0; i < 29; i++) {
+    rows.push({ ts: now, client_ip: '198.51.100.20', host: 'www.example.com', method: 'GET',
+      uri: `/assets/cached${i}.css`, status: 304, user_agent: 'Safari', suspicious_path: 0, size: 0 });
+  }
+  db.insertAccessEvents(d, rows);
+  const r = breach.ipSummary(d, { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '198.51.100.20');
+  assert.notEqual(r.verdict.level, 'watch', '40 paths but zero 404s is a visitor');
+  assert.doesNotMatch(r.verdict.text, /scan/i);
+});
+
+test('a scanner with a wall of 404s is still a scan', () => {
+  const d = db.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  rows.push({ ts: now, client_ip: '198.51.100.21', host: 'h', method: 'GET', uri: '/',
+    status: 200, user_agent: 'curl', suspicious_path: 0, size: 500 });
+  for (let i = 0; i < 40; i++) {
+    rows.push({ ts: now, client_ip: '198.51.100.21', host: 'h', method: 'GET',
+      uri: `/probe${i}/.env`, status: 404, user_agent: 'curl', suspicious_path: 0, size: 3212 });
+  }
+  db.insertAccessEvents(d, rows);
+  const r = breach.ipSummary(d, { sinceMs: 0, hostsWithAcl: new Set(), allowlistedIps: new Set() })
+    .find((x) => x.client_ip === '198.51.100.21');
+  assert.equal(r.verdict.level, 'watch');
+  assert.match(r.verdict.text, /scan/i);
+});
