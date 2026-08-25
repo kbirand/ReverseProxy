@@ -47,6 +47,26 @@ function sourceKey(req) {
   return req.ip || peer || 'unknown';
 }
 
+// A self-contained, mobile-first page. No external assets — it is served to a
+// phone from a bare endpoint. `pre` holds the monospace handoff report; `msg` is
+// a short human line for the empty/refused cases.
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+function page(title, msg, pre) {
+  return `<!doctype html><html><head><meta charset="utf-8">`
+    + `<meta name="viewport" content="width=device-width, initial-scale=1">`
+    + `<title>${esc(title)}</title><style>`
+    + `body{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:16px;`
+    + `background:#0f1419;color:#e6e6e6}h1{font-size:16px;margin:0 0 12px}`
+    + `pre{white-space:pre-wrap;word-break:break-word;font:12px/1.45 ui-monospace,Menlo,monospace;`
+    + `background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;overflow-x:auto}`
+    + `p{color:#9aa5b1}</style></head><body><h1>${esc(title)}</h1>`
+    + (msg ? `<p>${esc(msg)}</p>` : '')
+    + (pre ? `<pre>${esc(pre)}</pre>` : '')
+    + `</body></html>`;
+}
+
 function buildRouter(database, opts = {}) {
   const r = express.Router();
   const reloadCaddy = opts.reloadCaddy === undefined ? defaultReload : opts.reloadCaddy;
@@ -83,6 +103,35 @@ function buildRouter(database, opts = {}) {
     if (hits.size > 5000) hits.clear();       // unbounded growth is a memory bug
     return seen.length > RATE_MAX;
   };
+
+  // Read-only per-IP detail — the full report the notification had to truncate.
+  // GET, because it changes nothing; the same single-IP token gates it. A crawler
+  // that unfurls the link renders a path list (queries already redacted) and
+  // nothing more — no side effect, unlike the block POST above.
+  r.get('/details/:token', (req, res) => {
+    const now = Date.now();
+    const secret = typeof secretFor === 'function' ? secretFor() : secretFor;
+    const check = blockToken.verify(req.params.token, { secret, now });
+    if (!check.ok) {
+      return res.status(403).type('text/html').send(page('Not available',
+        'This link is not valid or has expired.'));
+    }
+    const ip = check.ip;
+    const rows = db.listRules(database)
+      .filter((x) => x.access_mode === 'whitelist' && (x.deny_ips || '').trim());
+    const hostsWithAcl = new Set(rows.map((x) => x.hostname));
+    const allowlistedIps = new Set(rows.flatMap((x) => x.deny_ips.split(/[\n,]+/)
+      .map((v) => v.replace(/#.*$/, '').trim()).filter(Boolean)));
+    const summary = breach.ipSummary(database, { hours: 24, hostsWithAcl, allowlistedIps, limit: 400 });
+    const row = summary.find((r) => r.client_ip === ip);
+    if (!row) {
+      return res.status(200).type('text/html').send(page(ip,
+        'No activity recorded for this source in the last 24 hours.'));
+    }
+    const paths = breach.pathsForIp(database, ip, { hours: 24, limit: 400 });
+    const report = breach.formatForHandoff({ row, paths, hours: 24 });
+    res.status(200).type('text/html').send(page(`${ip} — detail`, null, report));
+  });
 
   r.post('/:token', async (req, res) => {
     const now = Date.now();

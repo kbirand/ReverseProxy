@@ -267,3 +267,26 @@ test('refused paths are redacted and capped like served ones', () => {
   assert.doesNotMatch(msg.body, /abcd/, 'a query value must not ride a lock screen');
   assert.ok(msg.body.split('\n').length < 20, 'and the message stays readable');
 });
+
+// The notification truncates the probed list; a Details button opens the full
+// report. ntfy takes multiple actions, separated by ';'. Block stays first (it
+// is the decision), Details second (view opens the read-only page).
+test('a detail url adds a second, view action alongside Block', () => {
+  const row = { client_ip: '203.0.113.9', top_host: 'v.com', requests: 60, bytes: 1000,
+    real: 1, failures: 0, verdict: { level: 'watch', text: 'scan' } };
+  const msg = notify.buildMessage(row, {
+    blockUrl: 'https://link.example.com/b/TOK',
+    detailUrl: 'https://link.example.com/b/details/TOK',
+  });
+  const parts = msg.actions.split(';').map((s) => s.trim());
+  assert.match(parts[0], /^http, Block 203\.0\.113\.9/, 'Block is first');
+  assert.ok(parts.some((p) => /^view, Details, https:\/\/link\.example\.com\/b\/details\/TOK/.test(p)),
+    'Details is a view action to the detail page');
+});
+
+test('no detail url means only the Block action, as before', () => {
+  const row = { client_ip: '203.0.113.9', top_host: 'v.com', requests: 60, bytes: 1000,
+    real: 1, failures: 0, verdict: { level: 'watch', text: 'scan' } };
+  const msg = notify.buildMessage(row, { blockUrl: 'https://link.example.com/b/TOK' });
+  assert.doesNotMatch(msg.actions || '', /Details/);
+});

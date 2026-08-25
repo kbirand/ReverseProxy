@@ -69,7 +69,7 @@ const MAX_ENDPOINTS = 12;
 // Refused paths are supporting context, not the evidence, so fewer of them:
 // three .env variants already convey the shape of a sweep, and the count
 // beside them carries the scale.
-const MAX_PROBED = 4;
+const MAX_PROBED = 8;
 const MAX_PATH = 60;
 
 function endpointLines(paths) {
@@ -115,6 +115,16 @@ function blockAction(ip, blockUrl) {
   return `http, Block ${ip}, ${blockUrl}, method=POST, clear=true`;
 }
 
+// ntfy separates multiple actions with ';'. Block first — it is the decision —
+// then a view action opening the full per-IP detail page the message truncated.
+function actionsFor(ip, blockUrl, detailUrl) {
+  const out = [];
+  const b = blockAction(ip, blockUrl);
+  if (b) out.push(b);
+  if (detailUrl) out.push(`view, Details, ${detailUrl}`);
+  return out.length ? out.join('; ') : null;
+}
+
 function buildMessage(row, opts = {}) {
   const who = row.label ? ` (${row.label})` : '';
   const style = LEVEL_STYLE[row.verdict.level] || LEVEL_STYLE.alert;
@@ -133,7 +143,7 @@ function buildMessage(row, opts = {}) {
     priority: style.priority,
     tags: style.tags,
   };
-  const action = blockAction(row.client_ip, opts.blockUrl);
+  const action = actionsFor(row.client_ip, opts.blockUrl, opts.detailUrl);
   if (action) msg.actions = action;
   return msg;
 }
@@ -178,7 +188,9 @@ async function runOnce(db, rows, opts = {}) {
     let blockUrl = '';
     try { if (opts.pathsFor) paths = opts.pathsFor(row.client_ip) || []; } catch { paths = []; }
     try { if (opts.blockUrlFor) blockUrl = opts.blockUrlFor(row.client_ip) || ''; } catch { blockUrl = ''; }
-    const res = await send(buildMessage(row, { paths, blockUrl }), opts);
+    let detailUrl = '';
+    try { if (opts.detailUrlFor) detailUrl = opts.detailUrlFor(row.client_ip) || ''; } catch { detailUrl = ''; }
+    const res = await send(buildMessage(row, { paths, blockUrl, detailUrl }), opts);
     if (res.sent) {
       recordNotified(db, row.client_ip, row.verdict.level);
       sent.push(row.client_ip);

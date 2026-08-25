@@ -209,3 +209,61 @@ test('a broken push never breaks the block itself', async (t) => {
   assert.equal(res.status, 200, 'the block succeeded; feedback failing is not the block failing');
   assert.ok(db.listGlobalBlocks(database).some((b) => b.ip === '203.0.113.10'));
 });
+
+// The notification lists a handful of probed paths and then "…and N more". To
+// judge a scan you sometimes need the whole picture — the same per-IP report the
+// operator would otherwise have to open the panel for. A read-only detail page,
+// gated by the SAME single-IP token as the block button, serves that from the
+// same public hostname so it works from a phone anywhere.
+const dbmod = require('../db');
+
+function detailHarness(t) {
+  const database = dbmod.open(':memory:');
+  const now = Date.now();
+  const rows = [];
+  for (let i = 0; i < 40; i++) {
+    rows.push({ ts: now, client_ip: '203.0.113.9', host: 'videoevaluator.com', method: 'GET',
+      uri: `/probe${i}/.env`, status: 404, user_agent: 'curl', suspicious_path: 1, size: 3212 });
+  }
+  rows.push({ ts: now, client_ip: '203.0.113.9', host: 'videoevaluator.com', method: 'GET',
+    uri: '/', status: 200, user_agent: 'curl', suspicious_path: 0, size: 679 });
+  dbmod.insertAccessEvents(database, rows);
+  const app = express();
+  app.use('/api/block', blockAction.buildRouter(database, { secret: SECRET, reloadCaddy: async () => {} }));
+  const server = app.listen(0);
+  t.after(() => server.close());
+  const url = (tok) => `http://127.0.0.1:${server.address().port}/api/block/details/${tok}`;
+  return { url };
+}
+
+test('a valid token renders the per-IP detail page', async (t) => {
+  const { url } = detailHarness(t);
+  const tok = blockToken.mint('203.0.113.9', { secret: SECRET });
+  const res = await fetch(url(tok));
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /text\/html/);
+  const body = await res.text();
+  assert.match(body, /203\.0\.113\.9/, 'the IP it is about');
+  assert.match(body, /\/probe0\/\.env/, 'the probed paths the lock screen truncated');
+  assert.match(body, /videoevaluator\.com/);
+});
+
+test('the detail page is GET; a bad token shows a friendly refusal, not the data', async (t) => {
+  const { url } = detailHarness(t);
+  const res = await fetch(url(blockToken.mint('203.0.113.9', { secret: 'wrong' })));
+  assert.equal(res.status, 403);
+  assert.doesNotMatch(await res.text(), /probe0/, 'no data leaks on a bad token');
+});
+
+test('the block POST route is unaffected by the details path', async (t) => {
+  const database = dbmod.open(':memory:');
+  dbmod.createRule(database, { hostname: 'h.com', backend_host: '127.0.0.1', backend_port: 1,
+    enabled: 1, access_mode: 'whitelist', deny_ips: '1.2.3.4' });
+  const app = express();
+  app.use('/api/block', blockAction.buildRouter(database, { secret: SECRET, reloadCaddy: async () => {} }));
+  const server = app.listen(0);
+  t.after(() => server.close());
+  const tok = blockToken.mint('203.0.113.9', { secret: SECRET });
+  const res = await fetch(`http://127.0.0.1:${server.address().port}/api/block/${tok}`, { method: 'POST' });
+  assert.equal(res.status, 200, 'block still works');
+});

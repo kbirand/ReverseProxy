@@ -603,7 +603,13 @@ function renderConfig(rules, opts = {}) {
     ? DEFAULT_BLOCK_ACTION_PATH : normalizeBlockPath(opts.blockActionPath);
   if (blockActionHost) {
     const blockActionRoute = {
-      match: [{ host: [blockActionHost], path: [`${blockActionPath}/*`], method: ['POST'] }],
+      // POST for the block button, GET for the read-only detail page under
+      // <path>/details/*. The block route in Node is POST-only, so a GET to a
+      // block token 404s and blocks nothing; only /details/* answers GET.
+      match: [
+        { host: [blockActionHost], path: [`${blockActionPath}/*`], method: ['POST'] },
+        { host: [blockActionHost], path: [`${blockActionPath}/details/*`], method: ['GET'] },
+      ],
       handle: [
         // The panel sits behind this proxy, so express sees every request
         // coming from loopback and cannot rate-limit per source on its own.

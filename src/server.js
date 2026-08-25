@@ -171,6 +171,15 @@ function startBreachWatcher(database) {
           const token = blockToken.mint(ip, { secret: blockToken.secretFor(database) });
           return `https://${host}${DEFAULT_BLOCK_ACTION_PATH}/${token}`;
         },
+        // Same host and token as the block button; the read-only detail page lives
+        // under <path>/details/<token> and shows the full report the message
+        // truncated.
+        detailUrlFor: (ip) => {
+          const host = (process.env.BLOCK_ACTION_HOST || '').trim();
+          if (!host) return '';
+          const token = blockToken.mint(ip, { secret: blockToken.secretFor(database) });
+          return `https://${host}${DEFAULT_BLOCK_ACTION_PATH}/details/${token}`;
+        },
         onError: (ip, reason) => console.error(`[rproxy-ui] breach alert for ${ip} failed: ${reason}`),
       });
       for (const ip of sent) console.warn(`[rproxy-ui] BREACH ALERT sent for ${ip}`);
